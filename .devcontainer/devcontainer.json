@@ -1,0 +1,35 @@
+{
+  "name": "DREAMPlace (CUDA)",
+  "image": "dreamplace:cuda-ready",
+  "runArgs": [
+    "--gpus",
+    "all"
+  ],
+  "workspaceFolder": "/workspace/DREAMPlace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/DREAMPlace,type=bind",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-vscode.cpptools"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.analysis.extraPaths": [
+          "/workspace/DREAMPlace"
+        ]
+      }
+    }
+  },
+  "postCreateCommand": "python -V && python -c \"import torch; print(torch.__version__); print(torch.cuda.is_available())\"",
+  "postStartCommand": "python -c \"import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())\"",
+  "remoteEnv": {
+    "PYTHONPATH": "/workspace/DREAMPlace",
+    "PYTHON_EXECUTABLE": "/usr/local/bin/python",
+    "DREAMPLACE_BUILD_DIR": "build-gpu-sm120",
+    "DREAMPLACE_INSTALL_DIR": "install",
+    "DREAMPLACE_CXX_ABI": "1",
+    "DREAMPLACE_SKIP_PIP_INSTALL": "1"
+  }
+}

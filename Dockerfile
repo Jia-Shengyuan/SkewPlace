@@ -10,8 +10,9 @@ RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/machi
 
 
 # Installs system dependencies.
-RUN apt-get update \
-        && apt-get install -y \
+RUN apt-get update -o Acquire::Retries=5 -o Acquire::http::Timeout=30 \
+        && apt-get install -y --fix-missing -o Acquire::Retries=5 -o Acquire::http::Timeout=30 \
+            git \
             flex \
             libcairo2-dev \
             libboost-all-dev 
@@ -28,13 +29,5 @@ RUN mkdir /opt/cmake \
         && cmake --version
 
 # Installs python dependencies. 
-RUN pip install \
-        pyunpack>=0.1.2 \
-        patool>=1.12 \
-        matplotlib>=2.2.2 \
-        cairocffi>=0.9.0 \
-        pkgconfig>=1.4.0 \
-        setuptools>=39.1.0 \
-        scipy>=1.1.0 \
-        numpy>=1.15.4 \
-        shapely>=1.7.0
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt

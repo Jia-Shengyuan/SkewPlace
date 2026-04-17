@@ -7,29 +7,61 @@
 import os
 import sys
 from pyunpack import Archive
+
 if sys.version_info[0] < 3:
     import urllib2 as urllib
-    from StringIO import StringIO
 else:
     import urllib.request as urllib
-    from io import BytesIO as StringIO
 
 baseURL = "http://www.cerc.utexas.edu/~zixuan/"
 target_dir = os.path.dirname(os.path.abspath(__file__))
-filenames = ["ispd2005dp.tar.xz", "ispd2015dp.tar.xz"]
 
-for filename in filenames:
-    file_url = baseURL + filename
-    path_to_file = os.path.join(target_dir, filename)
+tasks = [
+    {
+        "archive": "ispd2005dp.tar.xz",
+        "marker": os.path.join(target_dir, "ispd2005", "adaptec1", "adaptec1.aux"),
+        "dataset_dir": os.path.join(target_dir, "ispd2005"),
+    },
+    {
+        "archive": "ispd2015dp.tar.xz",
+        "marker": os.path.join(target_dir, "ispd2015", "mgc_fft_1", "floorplan.def"),
+        "dataset_dir": os.path.join(target_dir, "ispd2015"),
+    },
+]
 
-    print("Download from %s to %s" % (file_url, path_to_file))
-    response = urllib.urlopen(file_url)
-    content = response.read()
-    with open(path_to_file, 'wb') as f:
-        f.write(content)
 
-    print("Uncompress %s to %s" % (path_to_file, target_dir))
-    Archive(path_to_file).extractall(target_dir)
+def ensure_benchmark(task):
+    archive_name = task["archive"]
+    marker = task["marker"]
+    dataset_dir = task["dataset_dir"]
+    archive_path = os.path.join(target_dir, archive_name)
 
-    print("remove downloaded file %s" % (path_to_file))
-    os.remove(path_to_file)
+    if os.path.exists(marker):
+        print("Benchmark already exists, skip: %s" % marker)
+        return
+
+    if os.path.isdir(dataset_dir) and os.listdir(dataset_dir):
+        print("Benchmark directory already exists, skip download: %s" % dataset_dir)
+        return
+
+    if os.path.exists(archive_path):
+        print("Use local archive %s" % archive_path)
+    else:
+        file_url = baseURL + archive_name
+        print("Download from %s to %s" % (file_url, archive_path))
+        response = urllib.urlopen(file_url)
+        content = response.read()
+        with open(archive_path, "wb") as f:
+            f.write(content)
+
+    print("Uncompress %s to %s" % (archive_path, target_dir))
+    Archive(archive_path).extractall(target_dir)
+
+    if os.path.exists(marker):
+        print("Benchmark ready: %s" % marker)
+    else:
+        raise RuntimeError("Extraction finished but marker is missing: %s" % marker)
+
+
+for t in tasks:
+    ensure_benchmark(t)

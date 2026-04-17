@@ -1,4 +1,6 @@
 build
+build-*
+build-*.log
 lib
 obj
 *.o
@@ -13,3 +15,9 @@ install
 *.so
 .DS_Store
 .vscode/*
+.cache/
+.nv/
+.bash_history
+opencode.log
+benchmarks/*.tar
+benchmarks/*.tar.*
