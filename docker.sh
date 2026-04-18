@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$ROOT_DIR/opencode.log"
-IMAGE="${DREAMPLACE_IMAGE:-dreamplace:devcontainer}"
-DOCKERFILE="${DREAMPLACE_DOCKERFILE:-$ROOT_DIR/.devcontainer/Dockerfile}"
+IMAGE="${DREAMPLACE_IMAGE:-}"
+DOCKERFILE="${DREAMPLACE_DOCKERFILE:-}"
 REBUILD=0
 BOOTSTRAP="${DREAMPLACE_BOOTSTRAP:-0}"
 CUDA_MODE=0
@@ -47,6 +47,18 @@ for arg in "$@"; do
     esac
 done
 
+if [[ -z "$IMAGE" ]]; then
+    if image_exists "dreamplace:cuda-ready"; then
+        IMAGE="dreamplace:cuda-ready"
+        CUDA_MODE=1
+    elif image_exists "dreamplace:devcontainer"; then
+        IMAGE="dreamplace:devcontainer"
+    else
+        IMAGE="dreamplace:cuda-ready"
+        CUDA_MODE=1
+    fi
+fi
+
 if [[ "$CUDA_MODE" -eq 1 ]]; then
     if [[ -z "${DREAMPLACE_IMAGE:-}" ]]; then
         if image_exists "dreamplace:cuda-ready"; then
@@ -72,6 +84,14 @@ if [[ "$CUDA_MODE" -eq 1 ]]; then
 
     if [[ "$IMAGE" == "dreamplace:readme-cuda-probe" ]]; then
         PYTHON_EXEC="/opt/conda/bin/python"
+    fi
+fi
+
+if [[ -z "$DOCKERFILE" ]]; then
+    if [[ "$CUDA_MODE" -eq 1 ]]; then
+        DOCKERFILE="$ROOT_DIR/.devcontainer/Dockerfile.cuda.sm120"
+    else
+        DOCKERFILE="$ROOT_DIR/Dockerfile"
     fi
 fi
 
@@ -127,15 +147,30 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
         "$IMAGE" bash -lc "./scripts/bootstrap_readme_env.sh"
 fi
 
-log_step "opening interactive shell in image $IMAGE"
+log_step "opening shell in image $IMAGE"
 
-docker run ${GPU_FLAG} -it --rm \
-    --user "$(id -u):$(id -g)" \
-    -e HOME=/workspace/DREAMPlace \
-    -e USER="${USER:-dwindz}" \
-    -e PYTHON_EXECUTABLE="${PYTHON_EXEC}" \
-    -v /etc/passwd:/etc/passwd:ro \
-    -v /etc/group:/etc/group:ro \
-    -v "$ROOT_DIR":/workspace/DREAMPlace \
-    -w /workspace/DREAMPlace \
-    "$IMAGE" bash
+if [[ -t 0 && -t 1 ]]; then
+    docker run ${GPU_FLAG} -it --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/workspace/DREAMPlace \
+        -e USER="${USER:-dwindz}" \
+        -e PYTHON_EXECUTABLE="${PYTHON_EXEC}" \
+        -v /etc/passwd:/etc/passwd:ro \
+        -v /etc/group:/etc/group:ro \
+        -v "$ROOT_DIR":/workspace/DREAMPlace \
+        -w /workspace/DREAMPlace \
+        "$IMAGE" bash
+else
+    echo "[docker.sh] non-interactive terminal detected; running startup probe"
+    docker run ${GPU_FLAG} --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/workspace/DREAMPlace \
+        -e USER="${USER:-dwindz}" \
+        -e PYTHON_EXECUTABLE="${PYTHON_EXEC}" \
+        -v /etc/passwd:/etc/passwd:ro \
+        -v /etc/group:/etc/group:ro \
+        -v "$ROOT_DIR":/workspace/DREAMPlace \
+        -w /workspace/DREAMPlace \
+        "$IMAGE" \
+        bash -lc "python -V && python -c 'import torch; print(\"torch\", torch.__version__); print(\"cuda\", torch.cuda.is_available())'"
+fi
