@@ -37,6 +37,10 @@ public:
   static void forward(
     ot::Timer& timer, torch::Tensor pos,
     const std::vector<std::string>& net_names, /* The net names. */
+    // [Jsy] The original interface only received raw pin names. Add
+    // node_names so the launcher can fall back to gate:pin names when the
+    // timer and PlaceDB do not share the same pin naming convention.
+    const std::vector<std::string>& node_names, /* The node names. */
     const std::vector<std::string>& pin_names, /* The pin names. */
     torch::Tensor flat_netpin, torch::Tensor netpin_start,
     torch::Tensor pin2node, torch::Tensor pin_offset_x, torch::Tensor pin_offset_y,

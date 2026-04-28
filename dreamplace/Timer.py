@@ -93,8 +93,71 @@ class Timer(object):
         """
         # The extraction should be called after the timing update every
         # time. The two functions are separated.
-        return timing_cpp.report_timing(
+        if self.timer_engine != "opentimer":
+            raise NotImplementedError("report_timing is only implemented for OpenTimer")
+        # [Jsy] This used to call the global OpenTimer binding directly. Route
+        # it through the module selected at Timer construction so the wrapper
+        # stays consistent with the active timing backend.
+        return self.timing_cpp_module.report_timing(
             self.raw_timer, n, self.placedb.net_name2id_map)
+
+    def report_timing_paths(self, n=1):
+        """@brief report detailed timing path information."""
+        # [Jsy] Originally Timer only exposed net ids on critical paths. Add a
+        # path-level API here so post-placement reg-to-reg extraction can reuse
+        # the existing timer instance without changing placement flow.
+        if self.timer_engine != "opentimer":
+            raise NotImplementedError("report_timing_paths is only implemented for OpenTimer")
+        return self.timing_cpp_module.report_timing_paths(self.raw_timer, n)
+
+    def report_timing_paths_by_split(self, split, n=1):
+        """@brief report detailed timing path information for a single split."""
+        if self.timer_engine != "opentimer":
+            raise NotImplementedError("report_timing_paths_by_split is only implemented for OpenTimer")
+        return self.timing_cpp_module.report_timing_paths_by_split(self.raw_timer, n, split)
+
+    def report_test_paths_by_split(self, split, n=None):
+        """@brief report detailed sequential test paths for a single split."""
+        if self.timer_engine != "opentimer":
+            raise NotImplementedError("report_test_paths_by_split is only implemented for OpenTimer")
+        # [Jsy] Exporting every sequential test path is too expensive on large
+        # benchmarks. Allow callers to cap the OpenTimer report count and then
+        # filter the returned paths to sequential endpoints in Python.
+        if n is not None:
+            paths = [
+                path for path in self.report_timing_paths_by_split(split, n=n)
+                if path.get("endpoint_type") == "test"
+            ]
+        else:
+            paths = self.timing_cpp_module.report_test_paths_by_split(self.raw_timer, split)
+        # [Jsy] OpenTimer can return an empty list for K>1 on tiny examples even
+        # when the top-1 split path exists. Fall back to K=1 so the Python-level
+        # reg-to-reg export still sees the sequential path we need for prototyping.
+        if not paths and self.raw_timer.num_tests() > 0:
+            paths = [
+                path for path in self.report_timing_paths_by_split(split, n=1)
+                if path.get("endpoint_type") == "test"
+            ]
+        return paths
+
+    def export_reg2reg_timing_graph(self, n=None, include_paths=False):
+        """@brief export a register-to-register timing graph from OpenTimer paths."""
+        # [Jsy] Keep the graph export on Timer instead of a separate entry
+        # point so downstream prototypes can work from the same STA state.
+        if self.timer_engine != "opentimer":
+            raise NotImplementedError("reg-to-reg timing graph export is only implemented for OpenTimer")
+        return self.timing_module.export_reg2reg_timing_graph(
+            self, n=n, include_paths=include_paths)
+
+    def solve_useful_skew(self, n=None, max_skew=None):
+        """@brief solve the minimal useful-skew LP on exported timing paths."""
+        # [Jsy] The original Timer stopped at reporting timing. Expose the
+        # minimal LP prototype here to validate useful-skew after placement
+        # before touching the main placement objective.
+        if self.timer_engine != "opentimer":
+            raise NotImplementedError("useful skew prototype is only implemented for OpenTimer")
+        return self.timing_module.solve_useful_skew_from_timer(
+            self, n=n, max_skew=max_skew)
 
     # ----------------------    
     # In the following, we define some accessors. Note that they are

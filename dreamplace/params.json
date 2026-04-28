@@ -152,6 +152,10 @@
     "description" : "whether dump intermediate global placement solution as a compressed pickle object", 
     "default" : 0
     },
+"dump_global_place_checkpoint_steps" : {
+    "description" : "comma-separated or list-like global placement iteration checkpoints to dump as compressed pickle objects", 
+    "default" : []
+    },
 "dump_legalize_solution_flag" : {
     "description" : "whether dump intermediate legalization solution as a compressed pickle object", 
     "default" : 0
@@ -285,6 +289,18 @@
     "description" : "maximum net weight in timing opt (negative for infinity)",
     "default" : "inf",
     "required" : "required for timing-driven mode"
+    },
+"useful_skew_weighting_flag" : {
+    "description" : "enable useful-skew-adjusted timing weighting in OpenTimer lilith mode",
+    "default" : 0
+    },
+"useful_skew_weighting_n" : {
+    "description" : "number of worst sequential test paths per split used by useful-skew-aware weighting",
+    "default" : 100
+    },
+"useful_skew_max_skew" : {
+    "description" : "per-register skew bound in ps used by useful-skew-aware weighting; negative means unbounded",
+    "default" : 50.0
     },
 "use_bb" : {
     "description" : "whether use bb step", 

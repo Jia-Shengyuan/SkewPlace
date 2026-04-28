@@ -1,0 +1,139 @@
+library (minitimer_late) {
+  delay_model : table_lookup ;
+  time_unit : "1ps" ;
+  voltage_unit : "1V" ;
+  current_unit : "1mA" ;
+  leakage_power_unit : 1uW ;
+  capacitive_load_unit(1,ff);
+  pulling_resistance_unit : "1kohm" ;
+  default_fanout_load : 1.0 ;
+  default_inout_pin_cap : 0.0 ;
+  default_input_pin_cap : 0.0 ;
+  default_output_pin_cap : 0.0 ;
+  slew_lower_threshold_pct_rise : 20.0 ;
+  slew_lower_threshold_pct_fall : 20.0 ;
+  slew_upper_threshold_pct_rise : 80.0 ;
+  slew_upper_threshold_pct_fall : 80.0 ;
+  input_threshold_pct_rise : 50.0 ;
+  input_threshold_pct_fall : 50.0 ;
+  output_threshold_pct_rise : 50.0 ;
+  output_threshold_pct_fall : 50.0 ;
+  nom_voltage : 1.0 ;
+  nom_temperature : 25.0 ;
+  nom_process : 1.0 ;
+
+  lu_table_template(delay_template_1x1) {
+    variable_1 : input_net_transition ;
+    variable_2 : total_output_net_capacitance ;
+    index_1 ("1.0") ;
+    index_2 ("1.0") ;
+  }
+
+  lu_table_template(constraint_template_1x1) {
+    variable_1 : constrained_pin_transition ;
+    variable_2 : related_pin_transition ;
+    index_1 ("1.0") ;
+    index_2 ("1.0") ;
+  }
+
+  cell ("INV_X1") {
+    area : 1.0 ;
+    pin ("A") {
+      direction : input ;
+      capacitance : 1.0 ;
+    }
+    pin ("ZN") {
+      direction : output ;
+      max_capacitance : 20.0 ;
+      timing() {
+        related_pin : "A" ;
+        timing_sense : negative_unate ;
+        cell_rise (delay_template_1x1) { values ("40.0"); }
+        cell_fall (delay_template_1x1) { values ("40.0"); }
+        rise_transition (delay_template_1x1) { values ("18.0"); }
+        fall_transition (delay_template_1x1) { values ("18.0"); }
+      }
+    }
+  }
+
+  cell ("NAND2_X1") {
+    area : 1.0 ;
+    pin ("A1") {
+      direction : input ;
+      capacitance : 1.0 ;
+    }
+    pin ("A2") {
+      direction : input ;
+      capacitance : 1.0 ;
+    }
+    pin ("ZN") {
+      direction : output ;
+      max_capacitance : 20.0 ;
+      timing() {
+        related_pin : "A1" ;
+        timing_sense : negative_unate ;
+        cell_rise (delay_template_1x1) { values ("55.0"); }
+        cell_fall (delay_template_1x1) { values ("55.0"); }
+        rise_transition (delay_template_1x1) { values ("22.0"); }
+        fall_transition (delay_template_1x1) { values ("22.0"); }
+      }
+      timing() {
+        related_pin : "A2" ;
+        timing_sense : negative_unate ;
+        cell_rise (delay_template_1x1) { values ("55.0"); }
+        cell_fall (delay_template_1x1) { values ("55.0"); }
+        rise_transition (delay_template_1x1) { values ("22.0"); }
+        fall_transition (delay_template_1x1) { values ("22.0"); }
+      }
+    }
+  }
+
+  cell ("DFF_X1") {
+    area : 1.0 ;
+    pin ("CK") {
+      direction : input ;
+      capacitance : 1.0 ;
+      clock : true ;
+    }
+    pin ("D") {
+      direction : input ;
+      capacitance : 1.0 ;
+      timing() {
+        related_pin : "CK" ;
+        timing_type : setup_rising ;
+        rise_constraint (constraint_template_1x1) { values ("25.0"); }
+        fall_constraint (constraint_template_1x1) { values ("25.0"); }
+      }
+      timing() {
+        related_pin : "CK" ;
+        timing_type : hold_rising ;
+        rise_constraint (constraint_template_1x1) { values ("8.0"); }
+        fall_constraint (constraint_template_1x1) { values ("8.0"); }
+      }
+    }
+    pin ("Q") {
+      direction : output ;
+      max_capacitance : 20.0 ;
+      timing() {
+        related_pin : "CK" ;
+        timing_type : rising_edge ;
+        cell_rise (delay_template_1x1) { values ("60.0"); }
+        cell_fall (delay_template_1x1) { values ("60.0"); }
+        rise_transition (delay_template_1x1) { values ("25.0"); }
+        fall_transition (delay_template_1x1) { values ("25.0"); }
+      }
+    }
+    pin ("QN") {
+      direction : output ;
+      max_capacitance : 20.0 ;
+      timing() {
+        related_pin : "CK" ;
+        timing_type : rising_edge ;
+        cell_rise (delay_template_1x1) { values ("60.0"); }
+        cell_fall (delay_template_1x1) { values ("60.0"); }
+        rise_transition (delay_template_1x1) { values ("25.0"); }
+        fall_transition (delay_template_1x1) { values ("25.0"); }
+      }
+    }
+  }
+}

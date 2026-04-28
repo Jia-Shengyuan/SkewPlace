@@ -36,6 +36,7 @@ int timingCppLauncher(
     ot::Timer& timer,
     const T* x, const T* y,
     const std::vector<std::string>& net_names, /* The net names. */
+    const std::vector<std::string>& node_names, /* The node names. */
     const std::vector<std::string>& pin_names, /* The pin names. */
     const int* flat_netpin, const int* netpin_start,
     const int* pin2node, const T* pin_offset_x, const T* pin_offset_y,
@@ -48,6 +49,7 @@ int timingCppLauncher(
 void TimingCpp::forward(
     ot::Timer& timer, torch::Tensor pos,
     const std::vector<std::string>& net_names, /* The net names. */
+    const std::vector<std::string>& node_names, /* The node names. */
     const std::vector<std::string>& pin_names, /* The pin names. */
     torch::Tensor flat_netpin, torch::Tensor netpin_start,
     torch::Tensor pin2node, torch::Tensor pin_offset_x, torch::Tensor pin_offset_y,
@@ -77,6 +79,7 @@ void TimingCpp::forward(
             DREAMPLACE_TENSOR_DATA_PTR(pos, scalar_t),
             DREAMPLACE_TENSOR_DATA_PTR(pos, scalar_t) + pos.numel() / 2,
             net_names,  // Net names array (required by OpenTimer).
+            node_names, // [Jsy] Pass node names down so RC-tree construction can repair raw pin-name mismatches with gate:pin fallback.
             pin_names,  // Pin names array (required by OpenTimer).
             DREAMPLACE_TENSOR_DATA_PTR(flat_netpin, int),
             DREAMPLACE_TENSOR_DATA_PTR(netpin_start, int),
@@ -118,6 +121,7 @@ int timingCppLauncher(
     ot::Timer& timer, /* The timer containing RCTrees. */
     const T* x, const T* y,
     const std::vector<std::string>& net_names,
+    const std::vector<std::string>& node_names,
     const std::vector<std::string>& pin_names,
     const int* flat_netpin, const int* netpin_start,
     const int* pin2node, const T* pin_offset_x, const T* pin_offset_y,
@@ -153,6 +157,28 @@ int timingCppLauncher(
   // We traverse all the nets in the netlist.
   omp_lock_t lock;
   omp_init_lock(&lock);
+
+  // [Jsy] The original code assumed pin_names already matched timer pin names.
+  // LEF/DEF flows can instead expose timer pins as gate:pin, so recover that
+  // form from node_names before giving up on the raw pin name.
+  auto resolve_timer_pin_name =
+      [&](int pin_id) -> std::string {
+    const auto& raw_name = pin_names[pin_id];
+    if (timer.pins().find(raw_name) != timer.pins().end()) {
+      return raw_name;
+    }
+
+    const auto node_id = pin2node[pin_id];
+    if (node_id >= 0 && node_id < static_cast<int>(node_names.size())) {
+      const auto candidate = node_names[node_id] + ":" + raw_name;
+      if (timer.pins().find(candidate) != timer.pins().end()) {
+        return candidate;
+      }
+    }
+
+    return raw_name;
+  };
+
 #pragma omp parallel for
   for (int i = 0; i < num_nets; ++i) {
     // The reference to the net instance in the timer.
@@ -174,7 +200,11 @@ int timingCppLauncher(
         [&](int index) -> std::string {
       auto name = net_names[i] + ":" + std::to_string(index - degree + 1);
       if (index < degree) {
-        name = pin_names[flat_netpin[index + netpin_start[i]]];
+        const int pin_id = flat_netpin[index + netpin_start[i]];
+        // [Jsy] Previously this used pin_names[...] directly. Resolve through
+        // the helper so existing flows still work when OpenTimer stores the
+        // endpoint as gate:pin instead of the raw DEF pin name.
+        name = resolve_timer_pin_name(pin_id);
         if (!tree.node(name)) tree.insert_node(name, 0);
         // Set the inner pin pointer of this rc node.
         auto pin_iter = timer.pins().find(name);
@@ -311,7 +341,10 @@ int timingCppLauncher(
       emplace_rc_node(global2inner_map[root]);
     }
     // Assign root node to this RC tree.
-    tree.assign_root(pin_names[root]);
+    // [Jsy] Root assignment must use the same resolved name as inserted RC
+    // nodes; otherwise single-pin or fully overlapped nets can miss the root
+    // pin when only the gate:pin form exists in OpenTimer.
+    tree.assign_root(resolve_timer_pin_name(root));
     tree.update_rc_timing();
 
     // Dump some useful information for debugging.

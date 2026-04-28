@@ -166,10 +166,21 @@ def slice_non_fence_region(
             continue
         intersect = non_fence_region.intersection(cvx_hull)
 
-        if isinstance(intersect, Polygon) and len(intersect.bounds) == 4:
-            slices.append(intersect.bounds)
+        # [Jsy] We originally assumed every slice intersection had finite
+        # bounds. ISPD2015 produced empty/degenerate polygons with NaN bounds,
+        # so filter them out before appending bounding boxes.
+        if isinstance(intersect, Polygon) and not intersect.is_empty and len(intersect.bounds) == 4:
+            bounds = intersect.bounds
+            if np.isfinite(bounds).all():
+                slices.append(bounds)
         elif isinstance(intersect, (GeometryCollection, MultiPolygon)):
-            slices.extend([j.bounds for j in intersect.geoms if (isinstance(j, Polygon) and len(j.bounds) == 4)])
+            slices.extend(
+                [
+                    j.bounds
+                    for j in intersect.geoms
+                    if isinstance(j, Polygon) and not j.is_empty and len(j.bounds) == 4 and np.isfinite(j.bounds).all()
+                ]
+            )
 
     if merge:
         raw_bbox_list = sorted(slices, key=lambda x: (x[1], x[0]))
@@ -185,10 +196,16 @@ def slice_non_fence_region(
             else:
                 bbox_list.append(cur_bbox)
                 cur_bbox = [minx, miny, maxx, maxy]
-        else:
+        if cur_bbox is not None:
             bbox_list.append(cur_bbox)
     else:
         bbox_list = slices
+
+    # [Jsy] The previous code fell through even when all candidate slices were
+    # filtered away. Return an empty tensor early so later tensor code sees a
+    # valid zero-sized region list instead of malformed bounds.
+    if len(bbox_list) == 0:
+        return torch.empty((0, 4), dtype=regions.dtype, device=device)
 
     if plot:
         from descartes.patch import PolygonPatch

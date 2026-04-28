@@ -1,0 +1,44 @@
+VERSION 5.7 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN minitimer ;
+UNITS DISTANCE MICRONS 2000 ;
+
+DIEAREA ( 0 0 ) ( 30400 5600 ) ;
+
+ROW ROW_0 FreePDK45_38x28_10R_NP_162NW_34O 0 0 N DO 160 BY 1 STEP 380 0 ;
+ROW ROW_1 FreePDK45_38x28_10R_NP_162NW_34O 0 2800 N DO 160 BY 1 STEP 380 0 ;
+
+COMPONENTS 3 ;
+  - reg0 DFF_X1
+    + PLACED ( 3800 0 ) N ;
+  - comb0 INV_X1
+    + PLACED ( 11400 0 ) N ;
+  - reg1 DFF_X1
+    + PLACED ( 19000 0 ) N ;
+END COMPONENTS
+
+PINS 3 ;
+  - clk + NET clk
+    + DIRECTION INPUT
+    + FIXED ( 0 2800 ) N
+    + LAYER metal3 ( 0 0 ) ( 140 140 ) ;
+  - in1 + NET in1
+    + DIRECTION INPUT
+    + FIXED ( 0 0 ) N
+    + LAYER metal3 ( 0 0 ) ( 140 140 ) ;
+  - out1 + NET out1
+    + DIRECTION OUTPUT
+    + FIXED ( 30400 2800 ) N
+    + LAYER metal3 ( 0 0 ) ( 140 140 ) ;
+END PINS
+
+NETS 4 ;
+  - clk ( PIN clk ) ( reg0 CK ) ( reg1 CK ) ;
+  - in1 ( PIN in1 ) ( reg0 D ) ;
+  - n_q0 ( reg0 Q ) ( comb0 A ) ;
+  - n_mid ( comb0 ZN ) ( reg1 D ) ;
+  - out1 ( reg1 Q ) ( PIN out1 ) ;
+END NETS
+
+END DESIGN
