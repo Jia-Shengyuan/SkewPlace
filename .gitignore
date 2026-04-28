@@ -21,3 +21,4 @@ install
 opencode.log
 benchmarks/*.tar
 benchmarks/*.tar.*
+benchmarks/iccad2015.ot/
