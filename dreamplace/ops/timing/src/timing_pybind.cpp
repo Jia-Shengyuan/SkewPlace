@@ -1,8 +1,132 @@
 #include "timing/src/timing_cpp.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/stl_bind.h>
+
+#include <cmath>
 
 DREAMPLACE_BEGIN_NAMESPACE
+
+namespace {
+
+// [Jsy] The original pybind layer only exported critical-path net ids. Useful
+// skew needs structured per-path metadata, so build Python dictionaries here
+// instead of forcing downstream code to scrape OpenTimer's text reports.
+pybind11::dict make_point_dict(const ot::Point& point) {
+  pybind11::dict result;
+  result["pin_name"] = point.pin.name();
+  result["transition"] = to_string(point.transition);
+  result["arrival_time"] = point.at;
+  result["net_name"] = point.pin.net() ? point.pin.net()->name() : std::string();
+  result["gate_name"] = point.pin.gate() ? point.pin.gate()->name() : std::string();
+  result["cell_name"] = point.pin.gate() ? point.pin.gate()->cell_name() : std::string();
+  result["is_primary_input"] = point.pin.primary_input() != nullptr;
+  result["is_primary_output"] = point.pin.primary_output() != nullptr;
+  result["is_datapath_source"] = point.pin.is_datapath_source();
+  return result;
+}
+
+float path_required_time(const ot::Path& path) {
+  if (path.empty() || path.endpoint == nullptr) {
+    return std::nanf("");
+  }
+
+  const auto split = path.endpoint->split();
+  const float arrival_time = path.back().at;
+  return split == ot::MIN ? arrival_time - path.slack : arrival_time + path.slack;
+}
+
+float path_delay(const ot::Path& path) {
+  if (path.empty()) {
+    return std::nanf("");
+  }
+  return path.back().at - path.front().at;
+}
+
+pybind11::dict make_path_dict(const ot::Path& path) {
+  pybind11::dict result;
+  pybind11::list points;
+
+  for (const auto& point : path) {
+    points.append(make_point_dict(point));
+  }
+
+  result["slack"] = path.slack;
+  result["path_delay"] = path_delay(path);
+  result["required_time"] = path_required_time(path);
+  result["num_points"] = path.size();
+  result["analysis_type"] = path.endpoint ? to_string(path.endpoint->split()) : std::string();
+  result["endpoint_transition"] = path.endpoint ? to_string(path.endpoint->transition()) : std::string();
+  result["start_pin_name"] = path.empty() ? std::string() : path.front().pin.name();
+  result["end_pin_name"] = path.empty() ? std::string() : path.back().pin.name();
+  result["start_gate_name"] = path.empty() || !path.front().pin.gate() ? std::string() : path.front().pin.gate()->name();
+  result["end_gate_name"] = path.empty() || !path.back().pin.gate() ? std::string() : path.back().pin.gate()->name();
+  result["start_cell_name"] = path.empty() || !path.front().pin.gate() ? std::string() : path.front().pin.gate()->cell_name();
+  result["end_cell_name"] = path.empty() || !path.back().pin.gate() ? std::string() : path.back().pin.gate()->cell_name();
+  result["points"] = points;
+
+  if (path.endpoint && path.endpoint->test()) {
+    const auto* test = path.endpoint->test();
+    result["endpoint_type"] = "test";
+    result["test_constraint"] = test->constraint(path.endpoint->split(), path.endpoint->transition()).value_or(std::nanf(""));
+    result["capture_pin_name"] = test->constrained_pin().name();
+    result["capture_gate_name"] = test->constrained_pin().gate() ? test->constrained_pin().gate()->name() : std::string();
+    result["capture_cell_name"] = test->constrained_pin().gate() ? test->constrained_pin().gate()->cell_name() : std::string();
+    result["related_pin_name"] = test->related_pin().name();
+    result["related_gate_name"] = test->related_pin().gate() ? test->related_pin().gate()->name() : std::string();
+    result["related_cell_name"] = test->related_pin().gate() ? test->related_pin().gate()->cell_name() : std::string();
+  }
+  else if (path.endpoint && path.endpoint->primary_output()) {
+    result["endpoint_type"] = "primary_output";
+  }
+  else {
+    result["endpoint_type"] = "unknown";
+  }
+
+  return result;
+}
+
+std::vector<pybind11::dict> _report_timing_paths(
+    ot::Timer& timer, int n) {
+  std::vector<pybind11::dict> result;
+  // [Jsy] Reuse timer.report_timing(n) and convert in place so the new API
+  // stays aligned with OpenTimer's existing worst-path ordering.
+  const auto& paths = timer.report_timing(n);
+  result.reserve(paths.size());
+  for (const auto& path : paths) {
+    result.emplace_back(make_path_dict(path));
+  }
+  return result;
+}
+
+std::vector<pybind11::dict> _report_timing_paths_by_split(
+    ot::Timer& timer, int n, const std::string& split) {
+  std::vector<pybind11::dict> result;
+  const auto split_enum = (split == "min") ? ot::MIN : ot::MAX;
+  const auto& paths = timer.report_timing(n, split_enum);
+  result.reserve(paths.size());
+  for (const auto& path : paths) {
+    result.emplace_back(make_path_dict(path));
+  }
+  return result;
+}
+
+std::vector<pybind11::dict> _report_test_paths_by_split(
+    ot::Timer& timer, const std::string& split) {
+  std::vector<pybind11::dict> result;
+  const auto split_enum = (split == "min") ? ot::MIN : ot::MAX;
+  const auto num_tests = static_cast<int>(timer.num_tests());
+  const auto& paths = timer.report_timing(num_tests, split_enum);
+  result.reserve(paths.size());
+  for (const auto& path : paths) {
+    if (path.endpoint && path.endpoint->test()) {
+      result.emplace_back(make_path_dict(path));
+    }
+  }
+  return result;
+}
+
+}  // namespace
 
 ///
 /// Implementation of a static class method.
@@ -203,5 +327,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("update_net_weights", &DREAMPLACE_NAMESPACE::TimingCpp::update_net_weights, "Update net weights");
   m.def("evaluate_slack", &DREAMPLACE_NAMESPACE::TimingCpp::evaluate_slack, "Evaluate nets hpwl");
   m.def("report_timing", &DREAMPLACE_NAMESPACE::_report_timing, "Report timing paths");
+  m.def("report_timing_paths", &DREAMPLACE_NAMESPACE::_report_timing_paths, "Report detailed timing paths");
+  m.def("report_timing_paths_by_split", &DREAMPLACE_NAMESPACE::_report_timing_paths_by_split, "Report detailed timing paths for one split");
+  m.def("report_test_paths_by_split", &DREAMPLACE_NAMESPACE::_report_test_paths_by_split, "Report sequential test paths for one split");
   m.def("io_forward", &DREAMPLACE_NAMESPACE::_timing_io_forward, "Timing IO function parsing constraint files");
 }

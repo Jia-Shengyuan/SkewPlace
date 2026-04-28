@@ -634,6 +634,127 @@ Useful skew sweep：
 - 目前 `n` 从 `10` 增到 `100` 的影响仍明显小于 `max_skew` 的影响，说明 LP 主要仍被少量关键 path 主导。
 - 在当前 LP 形式下，完全去掉 `max_skew` 上限会使问题无界或数值不稳定，因此不能直接把 `None` 解释为真实可实现的 ideal skew 上界。
 
+### 8.8 服务器整理后复跑确认
+
+当前已把服务器工作目录统一为：
+
+- `/home/shengyuanjia/SkewPlace`
+
+并清理掉旧目录 `/home/shengyuanjia/DREAMPlace` 以及家目录下的 tar/patch/tmp 产物。
+
+一个重要环境注意事项是：
+
+- 服务器 Docker 镜像里的 OpenTimer 是按 `/workspace/DREAMPlace` 编译的
+- 因此容器运行时必须挂载：
+  - `/home/shengyuanjia/SkewPlace:/workspace/DREAMPlace`
+- 如果改挂到 `/DREAMPlace`，OpenTimer 会找不到内置 `ot/sdc` 资源目录，日志会出现：
+  - `sdc home "" doesn't exist`
+  - `added 0 sdc commands`
+
+修正挂载路径后，`superblue1` 的 SDC 已重新确认正常读入：
+
+- `loading sdc "/workspace/DREAMPlace/benchmarks/iccad2015.ot/superblue1/superblue1.sdc" ...`
+- `added 13057 sdc commands`
+
+在这个正确环境下，重新对已有 checkpoint 做了 sweep 确认。
+
+#### `iter=100`
+
+- `clock_period = 9500 ps`
+- baseline: `setup.worst_slack = -21983.010 ps`
+
+| `n` | `max_skew=50 ps` | `max_skew=500 ps` | `max_skew=2000 ps` |
+| --- | ---: | ---: | ---: |
+| `1` | `-21933.016 ps` | `-21483.016 ps` | `-19983.016 ps` |
+| `10` | `-21883.010 ps` | `-20983.010 ps` | `-17983.010 ps` |
+| `100` | `-21883.010 ps` | `-20983.010 ps` | `-17983.010 ps` |
+
+#### `iter=300`
+
+- `clock_period = 9500 ps`
+- baseline: `setup.worst_slack = -17527.508 ps`
+
+| `n` | `max_skew=50 ps` | `max_skew=500 ps` | `max_skew=2000 ps` |
+| --- | ---: | ---: | ---: |
+| `1` | `-17477.516 ps` | `-17027.516 ps` | `-15527.516 ps` |
+| `10` | `-17427.508 ps` | `-16968.793 ps` | `-15468.793 ps` |
+| `100` | `-17427.508 ps` | `-16968.793 ps` | `-15468.793 ps` |
+
+#### `iter=500`
+
+- `clock_period = 9500 ps`
+- baseline: `setup.worst_slack = -24109.430 ps`
+
+| `n` | `max_skew=50 ps` | `max_skew=500 ps` | `max_skew=2000 ps` |
+| --- | ---: | ---: | ---: |
+| `1` | `-24059.441 ps` | `-23609.441 ps` | `-22109.441 ps` |
+| `10` | `-24059.430 ps` | `-23609.430 ps` | `-22109.430 ps` |
+| `100` | `-24009.430 ps` | `-23522.561 ps` | `-22022.561 ps` |
+
+#### `iter=700`
+
+- `clock_period = 9500 ps`
+- baseline: `setup.worst_slack = -19008.779 ps`
+
+| `n` | `max_skew=50 ps` | `max_skew=500 ps` | `max_skew=2000 ps` |
+| --- | ---: | ---: | ---: |
+| `1` | `-18958.777 ps` | `-18508.777 ps` | `-17008.777 ps` |
+| `10` | `-18958.779 ps` | `-18508.779 ps` | `-17008.779 ps` |
+| `100` | `-18958.779 ps` | `-18508.779 ps` | `-17008.779 ps` |
+
+这些复跑结果与之前整理出的趋势一致：
+
+- `n` 的影响通常仍小于 `max_skew`
+- `500 ps` 和 `2000 ps` 能继续改善 margin，但仍远小于当前主 setup 违例量级
+
+### 8.9 GP 内 timing-feedback 复跑结果（`iter=700`）
+
+在修正服务器容器挂载路径后，又重新做了 `iter=700` 的 GP 内 timing-feedback 对照：
+
+- baseline：`useful_skew_weighting_flag = 0`
+- skew-aware：`useful_skew_weighting_flag = 1, n = 100, max_skew = 500 ps`
+- skew-aware：`useful_skew_weighting_flag = 1, n = 100, max_skew = 2000 ps`
+
+共同实验条件：
+
+- `clock_period = 9500 ps = 9.5 ns`
+- `clock_freq ~= 105.26 MHz`
+- timing feedback 触发轮次仍为：
+  - `508, 523, 538, 553, 568, 583, 598, 613, 628, 643, 658, 673, 688`
+  - 共 `13` 次
+
+结果摘要：
+
+| 模式 | runtime | 最后一次 `tns` | 最后一次 `wns` | 最后一次 useful-skew margin |
+| --- | ---: | ---: | ---: | ---: |
+| baseline | `344.888 s` | `-99.145` | `-20.712` | N/A |
+| skew-aware `500 ps` | `520.091 s` | `-192.526` | `-22.254` | `-21254.125 ps` |
+| skew-aware `2000 ps` | `500.722 s` | `-187.312` | `-22.245` | `-18903.418 ps` |
+
+最后一次 skew-aware weighting 统计：
+
+- `max_skew = 500 ps`
+  - `num_registers = 73`
+  - `num_edges = 64`
+  - `raw_setup_wns = -22254.125 ps`
+  - `adjusted_setup_wns = -21254.125 ps`
+  - `affected_nets = 200`
+- `max_skew = 2000 ps`
+  - `num_registers = 72`
+  - `num_edges = 62`
+  - `raw_setup_wns = -22244.715 ps`
+  - `adjusted_setup_wns = -18903.418 ps`
+  - `affected_nets = 200`
+
+当前观察：
+
+- skew-aware 分支在真实大例子上仍然稳定触发了 `13` 次 feedback，不再只是 `iter=520` 时的一次性接通验证。
+- 更宽松的 `max_skew` 会明显改善“adjusted setup WNS”这个内部 weighting 信号。
+- 但到当前这版原型为止，最终 placement 的外部 `tns/wns` 还没有体现出收益，反而比 baseline 更差。
+- 因此这版 skew-aware weighting 目前仍只能说明：
+  - useful skew 信息已经成功进入 GP 内 net-weight update
+  - 但现有 weighting 映射方式还没有转化成最终时序收益
+
 ## 9. 服务器 Git 状态说明
 
 服务器上的 `/home/shengyuanjia/DREAMPlace-useful-skew` 目前不适合直接做 `git pull` / `git push`，原因不是账户本身，而是：

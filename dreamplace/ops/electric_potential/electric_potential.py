@@ -406,12 +406,19 @@ class ElectricPotential(ElectricOverflow):
             node_size_y = fence_region[:,3] - fence_region[:,1]
         max_size_x = node_size_x.max()
         max_size_y = node_size_y.max()
-        num_fixed_impacted_bins_x = ((max_size_x + self.bin_size_x) /
-                                        self.bin_size_x).ceil().clamp(
-                                            max=self.num_bins_x)
-        num_fixed_impacted_bins_y = ((max_size_y + self.bin_size_y) /
-                                        self.bin_size_y).ceil().clamp(
-                                            max=self.num_bins_y)
+        # [Jsy] This used to pass tensor scalars into fixed_density_map(). The
+        # pybind entry expects plain integral bin counts, and ISPD2015 exposed
+        # that mismatch as an incompatible-argument TypeError.
+        num_fixed_impacted_bins_x = int(
+            ((max_size_x + self.bin_size_x) / self.bin_size_x)
+            .ceil()
+            .clamp(max=self.num_bins_x)
+            .item())
+        num_fixed_impacted_bins_y = int(
+            ((max_size_y + self.bin_size_y) / self.bin_size_y)
+            .ceil()
+            .clamp(max=self.num_bins_y)
+            .item())
 
         if pos.is_cuda:
             func = electric_potential_cuda.fixed_density_map
@@ -551,4 +558,3 @@ class ElectricPotential(ElectricOverflow):
                             self.target_density * bin_area).clamp_(min=0.0).sum()
 
             return density_cost, density_map.max() / bin_area
-

@@ -611,6 +611,7 @@ class BasicPlace(nn.Module):
             return timing.TimingOpt(
                 timer, # The timer should be at the same level as placedb.
                 placedb.net_names, # The net names are required by OpenTimer.
+                placedb.node_names, # [Jsy] Previously we only passed net/pin names. LEF/DEF timing pins may be stored as gate:pin in OpenTimer, so pass node_names for a fallback match instead of assuming raw pin_names always align.
                 placedb.pin_names, # The pin names are required by OpenTimer.
                 placedb.flat_net2pin_map,
                 placedb.flat_net2pin_start_map,
@@ -627,6 +628,9 @@ class BasicPlace(nn.Module):
                 wire_capacitance_per_micron=params.wire_capacitance_per_micron,
                 net_weighting_scheme=params.net_weighting_scheme,
                 momentum_decay_factor=params.momentum_decay_factor,
+                useful_skew_weighting_flag=getattr(params, "useful_skew_weighting_flag", 0),
+                useful_skew_weighting_n=getattr(params, "useful_skew_weighting_n", 100),
+                useful_skew_max_skew=getattr(params, "useful_skew_max_skew", 50.0),
                 scale_factor=params.scale_factor,
                 lef_unit=placedb.rawdb.lefUnit(),
                 def_unit=placedb.rawdb.defUnit(),

@@ -1,10 +1,45 @@
-import torch
-from torch.autograd import Function
-from torch import nn
-import numpy as np
-import dreamplace.ops.timing.timing_cpp as timing_cpp
 import logging
+import math
 import pdb
+
+import numpy as np
+import torch
+import dreamplace.ops.timing.timing_cpp as timing_cpp
+from torch import nn
+from torch.autograd import Function
+
+# [Jsy] timing.py originally only wrapped the RC-tree update and net-weight
+# feedback path. Import the useful-skew helpers here so Timer can expose the
+# prototype without bypassing the existing timing module abstraction.
+from dreamplace.ops.timing.useful_skew import export_reg2reg_timing_graph
+from dreamplace.ops.timing.useful_skew import build_reg2reg_timing_graph_from_split_paths
+from dreamplace.ops.timing.useful_skew import solve_useful_skew
+from dreamplace.ops.timing.useful_skew import solve_useful_skew_from_timer
+
+
+def _decode_if_bytes(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def _is_number(value):
+    return value is not None and isinstance(value, (int, float, np.floating)) and math.isfinite(float(value))
+
+
+def _unique_path_net_ids(path, net_name2id_map):
+    net_ids = []
+    seen = set()
+    for point in path.get("points", []):
+        net_name = _decode_if_bytes(point.get("net_name", ""))
+        if not net_name:
+            continue
+        net_id = net_name2id_map.get(net_name)
+        if net_id is None or net_id in seen:
+            continue
+        seen.add(net_id)
+        net_ids.append(net_id)
+    return net_ids
 
 class TimingIO(Function):
     """
@@ -37,7 +72,7 @@ class TimingIO(Function):
 
 class TimingOptFunction(Function):
     @staticmethod
-    def forward(ctx, timer, pos, net_names, pin_names, flat_netpin,
+    def forward(ctx, timer, pos, net_names, node_names, pin_names, flat_netpin,
                 netpin_start, pin2node_map, pin_offset_x, pin_offset_y,
                 wire_resistance_per_micron,
                 wire_capacitance_per_micron,
@@ -48,6 +83,7 @@ class TimingOptFunction(Function):
         @param timer the timer used when timing_cpp-driven mode is opened
         @param pos pin location (x array, y array), not cell location 
         @param net_names the name of each net
+        @param node_names the name of each node, used for gate:pin fallback
         @param pin_names the name of each pin
         @param flat_netpin flat netpin map, length of #pins 
         @param netpin_start starting index in netpin map for each net,
@@ -73,7 +109,10 @@ class TimingOptFunction(Function):
             timing_cpp.forward(
                 timer,
                 pos.view(pos.numel()),
-                net_names, pin_names,
+                # [Jsy] The original call only passed raw pin names. Forward
+                # node_names as well so the C++ side can recover gate:pin names
+                # when OpenTimer naming differs from PlaceDB pin naming.
+                net_names, node_names, pin_names,
                 torch.from_numpy(flat_netpin),
                 torch.from_numpy(netpin_start),
                 torch.from_numpy(pin2node_map),
@@ -86,17 +125,20 @@ class TimingOptFunction(Function):
         return torch.zeros(num_pins);
 
 class TimingOpt(nn.Module):
-    def __init__(self, timer, net_names, pin_names, flat_netpin,
+    def __init__(self, timer, net_names, node_names, pin_names, flat_netpin,
                  netpin_start, net_name2id_map, pin_name2id_map,
                  pin2node_map, pin_offset_x, pin_offset_y,
-                 net_criticality, net_criticality_deltas,
-                 net_weights, net_weight_deltas,
-                 wire_resistance_per_micron,
-                 wire_capacitance_per_micron,
-                 net_weighting_scheme,
-                 momentum_decay_factor,
-                 scale_factor, lef_unit, def_unit,
-                 ignore_net_degree):
+                  net_criticality, net_criticality_deltas,
+                  net_weights, net_weight_deltas,
+                  wire_resistance_per_micron,
+                  wire_capacitance_per_micron,
+                  net_weighting_scheme,
+                  momentum_decay_factor,
+                  useful_skew_weighting_flag,
+                  useful_skew_weighting_n,
+                  useful_skew_max_skew,
+                  scale_factor, lef_unit, def_unit,
+                  ignore_net_degree):
         """
         @brief Initialize the feedback module that inherits from the
          base neural network module in torch framework.
@@ -126,6 +168,9 @@ class TimingOpt(nn.Module):
         super(TimingOpt, self).__init__()
         self.timer = timer
         self.net_names = net_names
+        # [Jsy] Store node_names alongside pin_names because the timing core
+        # now needs both to resolve LEF/DEF pins against OpenTimer pins.
+        self.node_names = node_names
         self.pin_names = pin_names
         self.flat_netpin = flat_netpin
         self.netpin_start = netpin_start
@@ -142,6 +187,15 @@ class TimingOpt(nn.Module):
         self.wire_capacitance_per_micron = wire_capacitance_per_micron
         self.net_weighting_scheme = net_weighting_scheme
         self.momentum_decay_factor = momentum_decay_factor
+        self.useful_skew_weighting_flag = bool(useful_skew_weighting_flag)
+        self.useful_skew_weighting_n = int(useful_skew_weighting_n)
+        if useful_skew_max_skew is None:
+            self.useful_skew_max_skew = None
+        else:
+            self.useful_skew_max_skew = float(useful_skew_max_skew)
+            if self.useful_skew_max_skew < 0:
+                self.useful_skew_max_skew = None
+        self.last_useful_skew_weighting_stats = {}
 
         # The scale factor is important, together with the lef/def unit.
         # Since we require the actual wire-length evaluation (microns) to
@@ -161,7 +215,7 @@ class TimingOpt(nn.Module):
         return TimingOptFunction.apply(
             self.timer.raw_timer, # Pass the raw object!!
             pos, # The coordinates
-            self.net_names, self.pin_names,
+            self.net_names, self.node_names, self.pin_names,
             self.flat_netpin,
             self.netpin_start,
             self.pin2node_map, self.pin_offset_x, self.pin_offset_y,
@@ -185,6 +239,9 @@ class TimingOpt(nn.Module):
         @param max_net_weight the maximum net weight in timing opt
         @param n the maximum number of paths to be reported.
         """
+        if self.useful_skew_weighting_flag and self.net_weighting_scheme == "lilith":
+            return self._update_net_weights_useful_skew_lilith(max_net_weight=max_net_weight, n=n)
+
         if self.net_weighting_scheme == "adams": scm = 0
         elif self.net_weighting_scheme == "lilith": scm = 1
         else:
@@ -204,6 +261,122 @@ class TimingOpt(nn.Module):
             max_net_weight, # -1 indicates infinity upper bound
             self.ignore_net_degree
             )
+
+    def _update_net_weights_useful_skew_lilith(self, max_net_weight=np.inf, n=1):
+        effective_n = max(1, min(int(n), self.useful_skew_weighting_n))
+        path_sets = {
+            "max": self.timer.report_test_paths_by_split("max", n=effective_n),
+            "min": self.timer.report_test_paths_by_split("min", n=effective_n),
+        }
+        graph = build_reg2reg_timing_graph_from_split_paths(path_sets, include_paths=True)
+        solution = solve_useful_skew(graph, max_skew=self.useful_skew_max_skew)
+
+        stats = {
+            "enabled": True,
+            "sampled_n": effective_n,
+            "path_counts": graph.get("path_counts"),
+            "num_registers": graph.get("num_registers"),
+            "num_edges": graph.get("num_edges"),
+            "max_skew": self.useful_skew_max_skew,
+            "skew_success": bool(solution.get("success")),
+            "skew_status": int(solution.get("status", -1)),
+            "skew_message": solution.get("message"),
+            "skew_margin": solution.get("margin"),
+        }
+
+        if not solution.get("success") or not _is_number(solution.get("margin")):
+            logging.warning(
+                "useful-skew weighting fallback to raw lilith: success=%s status=%s message=%s",
+                solution.get("success"),
+                solution.get("status"),
+                solution.get("message"),
+            )
+            stats["fallback_to_raw"] = True
+            self.last_useful_skew_weighting_stats = stats
+            return timing_cpp.update_net_weights(
+                self.timer.raw_timer, n,
+                self.net_name2id_map,
+                torch.from_numpy(self.net_criticality),
+                torch.from_numpy(self.net_criticality_deltas),
+                torch.from_numpy(self.net_weights),
+                torch.from_numpy(self.net_weight_deltas),
+                torch.from_numpy(self.degree_map),
+                1,
+                self.momentum_decay_factor,
+                max_net_weight,
+                self.ignore_net_degree,
+            )
+
+        skews = solution.get("skews", {})
+        adjusted_net_slacks = {}
+        raw_setup_wns = None
+        adjusted_setup_wns = None
+
+        for edge in graph.get("edges", []):
+            setup_slack = edge.get("setup_slack")
+            if not _is_number(setup_slack):
+                continue
+
+            launch_skew = float(skews.get(edge["launch_register"], 0.0))
+            capture_skew = float(skews.get(edge["capture_register"], 0.0))
+            adjusted_setup_slack = float(setup_slack) + capture_skew - launch_skew
+
+            raw_setup_wns = float(setup_slack) if raw_setup_wns is None else min(raw_setup_wns, float(setup_slack))
+            adjusted_setup_wns = (
+                adjusted_setup_slack if adjusted_setup_wns is None else min(adjusted_setup_wns, adjusted_setup_slack)
+            )
+
+            setup_path = edge.get("setup_path")
+            if not setup_path:
+                continue
+
+            for net_id in _unique_path_net_ids(setup_path, self.net_name2id_map):
+                previous = adjusted_net_slacks.get(net_id)
+                if previous is None or adjusted_setup_slack < previous:
+                    adjusted_net_slacks[net_id] = adjusted_setup_slack
+
+        finite_max_weight = _is_number(max_net_weight)
+        updated_nets = 0
+        for net_id in range(len(self.net_weights)):
+            if self.degree_map[net_id] > self.ignore_net_degree:
+                continue
+
+            nc = 0.0
+            adjusted_slack = adjusted_net_slacks.get(net_id)
+            if (
+                adjusted_slack is not None
+                and adjusted_setup_wns is not None
+                and adjusted_setup_wns < 0.0
+                and adjusted_slack < 0.0
+            ):
+                nc = max(0.0, float(adjusted_slack) / float(adjusted_setup_wns))
+                updated_nets += 1
+
+            self.net_criticality[net_id] = (
+                np.power(1.0 + self.net_criticality[net_id], self.momentum_decay_factor)
+                * np.power(1.0 + nc, 1.0 - self.momentum_decay_factor)
+                - 1.0
+            )
+            self.net_weights[net_id] *= (1.0 + self.net_criticality[net_id])
+            if finite_max_weight and self.net_weights[net_id] > max_net_weight:
+                self.net_weights[net_id] = max_net_weight
+
+        stats["raw_setup_wns"] = raw_setup_wns
+        stats["adjusted_setup_wns"] = adjusted_setup_wns
+        stats["affected_nets"] = updated_nets
+        stats["fallback_to_raw"] = False
+        self.last_useful_skew_weighting_stats = stats
+        logging.info(
+            "useful-skew weighting: n=%d edges=%d margin=%.3f raw_setup_wns=%s adjusted_setup_wns=%s affected_nets=%d max_skew=%s",
+            effective_n,
+            graph.get("num_edges", 0),
+            float(solution.get("margin")),
+            "None" if raw_setup_wns is None else f"{raw_setup_wns:.3f}",
+            "None" if adjusted_setup_wns is None else f"{adjusted_setup_wns:.3f}",
+            updated_nets,
+            self.useful_skew_max_skew,
+        )
+        return 0
 
     def evaluate_slack(self):
         """

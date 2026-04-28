@@ -514,6 +514,25 @@ class NonLinearPlace(BasicPlace.BasicPlace):
 
                     # actually reports the metric before step
                     logging.info(cur_metric)
+                    checkpoint_steps = getattr(params, "dump_global_place_checkpoint_steps", [])
+                    if isinstance(checkpoint_steps, str):
+                        checkpoint_steps = [
+                            int(item) for item in checkpoint_steps.split(",") if item.strip()
+                        ]
+                    checkpoint_steps = set(int(item) for item in checkpoint_steps)
+                    if iteration in checkpoint_steps:
+                        checkpoint_dir = os.path.join(
+                            params.result_dir,
+                            params.design_name(),
+                            "gp_checkpoints",
+                        )
+                        os.makedirs(checkpoint_dir, exist_ok=True)
+                        checkpoint_file = os.path.join(
+                            checkpoint_dir,
+                            "%s.iter%d.gp.pklz" % (params.design_name(), iteration),
+                        )
+                        self.dump(params, placedb, self.pos[0].cpu(), checkpoint_file)
+                        logging.info("dumped global placement checkpoint to %s", checkpoint_file)
                     # record the best outer cell overflow
                     if best_metric[0] is None or best_metric[0].overflow[-1] > cur_metric.overflow[-1]:
                         best_metric[0] = cur_metric
