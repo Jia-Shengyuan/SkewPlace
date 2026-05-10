@@ -519,4 +519,101 @@ void TimingCpp::evaluate_slack(
       });
 }
 
+template <typename T>
+void netSlackCppLauncher(
+    ot::Timer& timer,
+    const _timing_impl::string2index_map_type& net_name2id_map,
+    T* slack) {
+  for (const auto& [name, net] : timer.nets()) {
+    if (net_name2id_map.find(name) == net_name2id_map.end()) continue;
+    auto id = net_name2id_map.at(name);
+    slack[id] = report_net_slack(timer, net);
+  }
+}
+
+void TimingCpp::evaluate_net_slack(
+    ot::Timer& timer,
+    const _timing_impl::string2index_map_type& net_name2id_map,
+    torch::Tensor slack) {
+  CHECK_FLAT_CPU(slack);
+  CHECK_CONTIGUOUS(slack);
+
+  DREAMPLACE_DISPATCH_FLOATING_TYPES(
+      slack, "netSlackCppLauncher",
+      [&] {
+        netSlackCppLauncher<scalar_t>(
+            timer, net_name2id_map,
+            DREAMPLACE_TENSOR_DATA_PTR(slack, scalar_t));
+      });
+}
+
+template <typename T>
+void updateNetWeightsLilithWithNetSlackCppLauncher(
+    ot::Timer& timer,
+    const _timing_impl::string2index_map_type& net_name2id_map,
+    T* net_criticality,
+    T* net_weights,
+    const int* degree_map,
+    const T* net_slack,
+    T momentum_decay_factor,
+    T max_net_weight,
+    int ignore_net_degree) {
+  auto wns_opt = timer.report_wns();
+  if (!wns_opt) {
+    dreamplacePrint(kWARN, "report_wns returned no value; skip lilith net-weighting update\n");
+    return;
+  }
+  float wns = *wns_opt;
+  for (const auto& [name, net] : timer.nets()) {
+    if (net_name2id_map.find(name) == net_name2id_map.end()) continue;
+    int net_id = net_name2id_map.at(name);
+    float slack = static_cast<float>(net_slack[net_id]);
+    if (wns < 0) {
+      float nc = (slack < 0) ? std::max(0.f, slack / wns) : 0.f;
+      net_criticality[net_id] = std::pow(1 + net_criticality[net_id], momentum_decay_factor) *
+        std::pow(1 + nc, 1 - momentum_decay_factor) - 1;
+    }
+    if (degree_map[net_id] > ignore_net_degree) continue;
+    net_weights[net_id] *= (1 + net_criticality[net_id]);
+    if (net_weights[net_id] > max_net_weight) {
+      net_weights[net_id] = max_net_weight;
+    }
+  }
+}
+
+void TimingCpp::update_net_weights_lilith_with_net_slack(
+    ot::Timer& timer,
+    const _timing_impl::string2index_map_type& net_name2id_map,
+    torch::Tensor net_criticality,
+    torch::Tensor net_weights,
+    torch::Tensor degree_map,
+    torch::Tensor net_slack,
+    double momentum_decay_factor,
+    double max_net_weight,
+    int ignore_net_degree) {
+  CHECK_FLAT_CPU(net_criticality);
+  CHECK_CONTIGUOUS(net_criticality);
+  CHECK_FLAT_CPU(net_weights);
+  CHECK_CONTIGUOUS(net_weights);
+  CHECK_FLAT_CPU(degree_map);
+  CHECK_CONTIGUOUS(degree_map);
+  CHECK_FLAT_CPU(net_slack);
+  CHECK_CONTIGUOUS(net_slack);
+
+  DREAMPLACE_DISPATCH_FLOATING_TYPES(
+      net_weights, "updateNetWeightsLilithWithNetSlackCppLauncher",
+      [&] {
+        updateNetWeightsLilithWithNetSlackCppLauncher<scalar_t>(
+            timer,
+            net_name2id_map,
+            DREAMPLACE_TENSOR_DATA_PTR(net_criticality, scalar_t),
+            DREAMPLACE_TENSOR_DATA_PTR(net_weights, scalar_t),
+            DREAMPLACE_TENSOR_DATA_PTR(degree_map, int),
+            DREAMPLACE_TENSOR_DATA_PTR(net_slack, scalar_t),
+            static_cast<scalar_t>(momentum_decay_factor),
+            static_cast<scalar_t>(max_net_weight),
+            ignore_net_degree);
+      });
+}
+
 DREAMPLACE_END_NAMESPACE

@@ -326,6 +326,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &DREAMPLACE_NAMESPACE::TimingCpp::forward, "Report timing forward");
   m.def("update_net_weights", &DREAMPLACE_NAMESPACE::TimingCpp::update_net_weights, "Update net weights");
   m.def("evaluate_slack", &DREAMPLACE_NAMESPACE::TimingCpp::evaluate_slack, "Evaluate nets hpwl");
+  m.def("evaluate_net_slack", &DREAMPLACE_NAMESPACE::TimingCpp::evaluate_net_slack, "Evaluate net slack");
+  m.def("update_net_weights_lilith_with_net_slack", &DREAMPLACE_NAMESPACE::TimingCpp::update_net_weights_lilith_with_net_slack, "Update lilith net weights with external net slack");
   m.def("report_timing", &DREAMPLACE_NAMESPACE::_report_timing, "Report timing paths");
   m.def("report_timing_paths", &DREAMPLACE_NAMESPACE::_report_timing_paths, "Report detailed timing paths");
   m.def("report_timing_paths_by_split", &DREAMPLACE_NAMESPACE::_report_timing_paths_by_split, "Report detailed timing paths for one split");

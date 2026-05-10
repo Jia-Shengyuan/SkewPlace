@@ -6,6 +6,46 @@ import dreamplace.ops.timing_heterosta.timing_heterosta_cpp as timing_hs_cpp
 import logging
 import pdb
 
+from dreamplace.ops.timing.useful_skew import build_reg2reg_timing_graph_from_split_paths
+from dreamplace.ops.timing.useful_skew import export_reg2reg_timing_graph
+from dreamplace.ops.timing.useful_skew import solve_useful_skew
+from dreamplace.ops.timing.useful_skew import solve_useful_skew_from_timer
+
+
+def _is_number(value):
+    return value is not None and isinstance(value, (int, float, np.floating)) and np.isfinite(float(value))
+
+
+def _pin2net_array(pin2net_map):
+    if hasattr(pin2net_map, 'detach'):
+        return pin2net_map.detach().cpu().numpy()
+    if hasattr(pin2net_map, 'cpu'):
+        return pin2net_map.cpu().numpy()
+    return np.asarray(pin2net_map)
+
+
+def _unique_path_net_ids(path, pin2net_map):
+    pin2net = _pin2net_array(pin2net_map)
+    net_ids = []
+    seen = set()
+    for point in path.get("points", []):
+        pin_id = point.get("pin_id")
+        if pin_id is None:
+            continue
+        pin_id = int(pin_id)
+        if pin_id < 0 or pin_id >= len(pin2net):
+            continue
+        net_id = int(pin2net[pin_id])
+        if net_id < 0 or net_id in seen:
+            continue
+        seen.add(net_id)
+        net_ids.append(net_id)
+    return net_ids
+
+
+def _is_timing_number(value):
+    return value is not None and isinstance(value, (int, float, np.floating)) and np.isfinite(float(value))
+
 def _convert_pin_direction_to_numeric(pin_direct_strings):
     """
     @brief Convert pin direction strings to numeric encoding
@@ -118,13 +158,17 @@ class TimingOptFunction(Function):
             logging.info("HeteroSTA: Converting pos to CPU for CPU timing analysis")
             pos = pos.cpu()
         
-        # Calculate pin positions using pin_pos_op
+        # HeteroSTA RC extraction expects pin coordinates indexed in the same
+        # order used to build the NetlistDB.
+        logging.info("HeteroSTA forward: before pin_pos_op (use_cuda=%s pos_is_cuda=%s pos_numel=%d)", bool(use_cuda), pos.is_cuda, pos.numel())
         pin_pos = pin_pos_op(pos)
+        logging.info("HeteroSTA forward: after pin_pos_op (pin_pos_is_cuda=%s pin_pos_numel=%d)", pin_pos.is_cuda, pin_pos.numel())
         
         # Create slack output tensor if requested
         if slacks_rf is None:
             slacks_rf = torch.Tensor()
         
+        logging.info("HeteroSTA forward: before timing_hs_cpp.forward")
         timing_hs_cpp.forward(
             timer,
             pin_pos,
@@ -134,6 +178,7 @@ class TimingOptFunction(Function):
             scale_factor, lef_unit, def_unit,
             slacks_rf,
             ignore_net_degree, bool(use_cuda))
+        logging.info("HeteroSTA forward: after timing_hs_cpp.forward")
         
         return torch.zeros(num_pins)
 
@@ -148,7 +193,10 @@ class TimingOpt(nn.Module):
                  momentum_decay_factor,
                  scale_factor, lef_unit, def_unit,
                  pin_pos_op,
-                 ignore_net_degree, use_cuda=False):
+                 ignore_net_degree, use_cuda=False,
+                 useful_skew_weighting_flag=0,
+                 useful_skew_weighting_n=100,
+                 useful_skew_max_skew=50.0):
         """
         @brief Initialize the feedback module for HeteroSTA timing analysis
         @param timer the HeteroSTA timer object
@@ -190,9 +238,26 @@ class TimingOpt(nn.Module):
         self.net_criticality_deltas = net_criticality_deltas  # torch.Tensor
         self.net_weights = net_weights  # torch.Tensor (shared with data_collections)
         self.net_weight_deltas = net_weight_deltas  # torch.Tensor
+        self.net_criticality_cpu = net_criticality.detach().cpu().clone()
+        self.net_criticality_deltas_cpu = net_criticality_deltas.detach().cpu().clone()
+        self.net_weights_cpu = net_weights.detach().cpu().clone()
+        self.net_weight_deltas_cpu = net_weight_deltas.detach().cpu().clone()
+        self.net_criticality_cpu = net_criticality.detach().cpu().clone()
+        self.net_criticality_deltas_cpu = net_criticality_deltas.detach().cpu().clone()
+        self.net_weights_cpu = net_weights.detach().cpu().clone()
+        self.net_weight_deltas_cpu = net_weight_deltas.detach().cpu().clone()
         self.wire_resistance_per_micron = wire_resistance_per_micron
         self.wire_capacitance_per_micron = wire_capacitance_per_micron
         self.momentum_decay_factor = momentum_decay_factor
+        self.useful_skew_weighting_flag = bool(useful_skew_weighting_flag)
+        self.useful_skew_weighting_n = int(useful_skew_weighting_n)
+        if useful_skew_max_skew is None:
+            self.useful_skew_max_skew = None
+        else:
+            self.useful_skew_max_skew = float(useful_skew_max_skew)
+            if self.useful_skew_max_skew < 0:
+                self.useful_skew_max_skew = None
+        self.last_useful_skew_weighting_stats = {}
         
         # The scale factor is important, together with the lef/def unit.
         # Since we require the actual wire-length evaluation (microns) to
@@ -213,6 +278,52 @@ class TimingOpt(nn.Module):
         
         # Store the pin_pos_op passed from outside
         self.pin_pos_op = pin_pos_op
+
+    def _active_weight_tensors(self):
+        if self.use_cuda:
+            return (
+                self.net_criticality,
+                self.net_criticality_deltas,
+                self.net_weights,
+                self.net_weight_deltas,
+            )
+        return (
+            self.net_criticality_cpu,
+            self.net_criticality_deltas_cpu,
+            self.net_weights_cpu,
+            self.net_weight_deltas_cpu,
+        )
+
+    def _sync_active_weights_to_placement(self):
+        if self.use_cuda:
+            return
+        self.net_criticality.copy_(self.net_criticality_cpu.to(self.net_criticality.device))
+        self.net_criticality_deltas.copy_(self.net_criticality_deltas_cpu.to(self.net_criticality_deltas.device))
+        self.net_weights.copy_(self.net_weights_cpu.to(self.net_weights.device))
+        self.net_weight_deltas.copy_(self.net_weight_deltas_cpu.to(self.net_weight_deltas.device))
+
+    def _active_weight_tensors(self):
+        if self.use_cuda:
+            return (
+                self.net_criticality,
+                self.net_criticality_deltas,
+                self.net_weights,
+                self.net_weight_deltas,
+            )
+        return (
+            self.net_criticality_cpu,
+            self.net_criticality_deltas_cpu,
+            self.net_weights_cpu,
+            self.net_weight_deltas_cpu,
+        )
+
+    def _sync_active_weights_to_placement(self):
+        if self.use_cuda:
+            return
+        self.net_criticality.copy_(self.net_criticality_cpu.to(self.net_criticality.device))
+        self.net_criticality_deltas.copy_(self.net_criticality_deltas_cpu.to(self.net_criticality_deltas.device))
+        self.net_weights.copy_(self.net_weights_cpu.to(self.net_weights.device))
+        self.net_weight_deltas.copy_(self.net_weight_deltas_cpu.to(self.net_weight_deltas.device))
 
     def forward(self, pos):
         """
@@ -240,7 +351,11 @@ class TimingOpt(nn.Module):
         @param max_net_weight the maximum net weight in timing opt
         @param n the maximum number of paths to be reported
         """
+        if self.useful_skew_weighting_flag:
+            return self._update_net_weights_useful_skew(max_net_weight=max_net_weight, n=n)
+
         try:
+            active_net_criticality, active_net_criticality_deltas, active_net_weights, active_net_weight_deltas = self._active_weight_tensors()
             # Convert flat_netpin and netpin_start to tensors
             flat_netpin_t = torch.from_numpy(self.flat_netpin)
             netpin_start_t = torch.from_numpy(self.netpin_start)
@@ -271,19 +386,142 @@ class TimingOpt(nn.Module):
                 flat_netpin_t,
                 netpin_start_t,
                 pin2net_map_t,
-                self.net_criticality,  # GPU tensor - modified in-place
-                self.net_criticality_deltas,  # GPU tensor
-                self.net_weights,  # GPU tensor - modified in-place (shared with data_collections)
-                self.net_weight_deltas,  # GPU tensor
+                active_net_criticality,
+                active_net_criticality_deltas,
+                active_net_weights,
+                active_net_weight_deltas,
                 degree_map_t,
                 max_net_weight, self.momentum_decay_factor,
                 self.ignore_net_degree, bool(self.use_cuda))
 
-            # No need to copy back - tensors were modified in-place!
+            self._sync_active_weights_to_placement()
 
         except Exception as e:
             logging.error(f"HeteroSTA net weight update failed: {e}")
             raise  # Re-raise the exception so caller knows it failed
+
+    def _update_net_weights_useful_skew(self, max_net_weight=np.inf, n=1):
+        effective_n = max(1, min(int(n), self.useful_skew_weighting_n))
+        path_sets = {
+            "max": self.report_timing_paths_by_split("max", n=effective_n),
+            "min": self.report_timing_paths_by_split("min", n=effective_n),
+        }
+        graph = build_reg2reg_timing_graph_from_split_paths(path_sets, include_paths=True)
+        solution = solve_useful_skew(graph, max_skew=self.useful_skew_max_skew)
+
+        stats = {
+            "enabled": True,
+            "sampled_n": effective_n,
+            "path_counts": graph.get("path_counts"),
+            "num_registers": graph.get("num_registers"),
+            "num_edges": graph.get("num_edges"),
+            "max_skew": self.useful_skew_max_skew,
+            "skew_success": bool(solution.get("success")),
+            "skew_status": int(solution.get("status", -1)),
+            "skew_message": solution.get("message"),
+            "skew_margin": solution.get("margin"),
+        }
+
+        if not solution.get("success") or not _is_number(solution.get("margin")):
+            logging.warning(
+                "HeteroSTA useful-skew weighting fallback to raw weighting: success=%s status=%s message=%s",
+                solution.get("success"),
+                solution.get("status"),
+                solution.get("message"),
+            )
+            stats["fallback_to_raw"] = True
+            self.last_useful_skew_weighting_stats = stats
+            return self._update_net_weights_raw(max_net_weight=max_net_weight, n=n)
+
+        skews = solution.get("skews", {})
+        net_slack_deltas = {}
+        raw_setup_wns = None
+        adjusted_setup_wns = None
+
+        for edge in graph.get("edges", []):
+            setup_slack = edge.get("setup_slack")
+            if not _is_timing_number(setup_slack):
+                continue
+
+            launch_skew = float(skews.get(edge["launch_register"], 0.0))
+            capture_skew = float(skews.get(edge["capture_register"], 0.0))
+            adjusted_setup_slack = float(setup_slack) + capture_skew - launch_skew
+
+            raw_setup_wns = float(setup_slack) if raw_setup_wns is None else min(raw_setup_wns, float(setup_slack))
+            adjusted_setup_wns = adjusted_setup_slack if adjusted_setup_wns is None else min(adjusted_setup_wns, adjusted_setup_slack)
+
+            setup_path = edge.get("setup_path")
+            if not setup_path:
+                continue
+
+            for net_id in _unique_path_net_ids(setup_path, self.pin2net_map):
+                previous = adjusted_net_slacks.get(net_id)
+                if previous is None or adjusted_setup_slack < previous:
+                    adjusted_net_slacks[net_id] = adjusted_setup_slack
+
+        finite_max_weight = _is_number(max_net_weight)
+        updated_nets = 0
+        device = self.net_weights.device if hasattr(self.net_weights, "device") else None
+        dtype = self.net_weights.dtype if hasattr(self.net_weights, "dtype") else None
+        degree_map_t = torch.from_numpy(self.degree_map)
+        if device is not None:
+            degree_map_t = degree_map_t.to(device)
+
+        for net_id in range(self.num_nets):
+            if self.degree_map[net_id] > self.ignore_net_degree:
+                continue
+
+            nc = 0.0
+            adjusted_slack = adjusted_net_slacks.get(net_id)
+            if (
+                adjusted_slack is not None
+                and adjusted_setup_wns is not None
+                and adjusted_setup_wns < 0.0
+                and adjusted_slack < 0.0
+            ):
+                nc = max(0.0, float(adjusted_slack) / float(adjusted_setup_wns))
+                updated_nets += 1
+
+            if hasattr(self.net_criticality[net_id], "item"):
+                current = float(self.net_criticality[net_id].item())
+            else:
+                current = float(self.net_criticality[net_id])
+            new_criticality = (
+                np.power(1.0 + current, self.momentum_decay_factor)
+                * np.power(1.0 + nc, 1.0 - self.momentum_decay_factor)
+                - 1.0
+            )
+            value = torch.tensor(new_criticality, device=device, dtype=dtype) if device is not None else new_criticality
+            self.net_criticality[net_id] = value
+            self.net_weights[net_id] *= (1.0 + new_criticality)
+            if finite_max_weight and float(self.net_weights[net_id].item()) > float(max_net_weight):
+                self.net_weights[net_id] = torch.tensor(float(max_net_weight), device=device, dtype=dtype)
+
+        stats["raw_setup_wns"] = raw_setup_wns
+        stats["adjusted_setup_wns"] = adjusted_setup_wns
+        stats["affected_nets"] = updated_nets
+        stats["fallback_to_raw"] = False
+        self.last_useful_skew_weighting_stats = stats
+        self._sync_active_weights_to_placement()
+        logging.info(
+            "HeteroSTA useful-skew weighting: n=%d edges=%d margin=%.3f raw_setup_wns=%s adjusted_setup_wns=%s affected_nets=%d max_skew=%s",
+            effective_n,
+            graph.get("num_edges", 0),
+            float(solution.get("margin")),
+            "None" if raw_setup_wns is None else f"{raw_setup_wns:.3f}",
+            "None" if adjusted_setup_wns is None else f"{adjusted_setup_wns:.3f}",
+            updated_nets,
+            self.useful_skew_max_skew,
+        )
+        return 0
+
+    def _update_net_weights_raw(self, max_net_weight=np.inf, n=1):
+        old_flag = self.useful_skew_weighting_flag
+        self.useful_skew_weighting_flag = False
+        try:
+            return self.update_net_weights(max_net_weight=max_net_weight, n=n)
+        finally:
+            self.useful_skew_weighting_flag = old_flag
     
     def write_spef(self,file_path):
         return self.timer.raw_timer.write_spef(file_path)
@@ -333,6 +571,30 @@ class TimingOpt(nn.Module):
         @param use_cuda whether to use CUDA
         """
         return self.timer.raw_timer.dump_paths_setup_to_file(num_paths, nworst, file_path, use_cuda)
+
+    def report_timing_paths_by_split(self, split, n=1):
+        """@brief report HeteroSTA timing paths with OpenTimer-like dictionaries."""
+        return self.timer.raw_timer.report_timing_paths_by_split(split, n, self.use_cuda)
+
+    def report_all_timing_paths_by_split(self, split):
+        """@brief report all available HeteroSTA timing paths for one split."""
+        return self.timer.raw_timer.report_all_timing_paths_by_split(split, self.use_cuda)
+
+    def export_reg2reg_timing_graph(self, n=None, include_paths=False):
+        """@brief export a register-to-register timing graph from HeteroSTA paths."""
+        path_sets = {
+            "max": self.report_timing_paths_by_split("max", n=n or 1),
+            "min": self.report_timing_paths_by_split("min", n=n or 1),
+        }
+        return build_reg2reg_timing_graph_from_split_paths(path_sets, include_paths=include_paths)
+
+    def export_full_reg2reg_timing_graph(self, include_paths=False):
+        """@brief export a register-to-register timing graph from all available HeteroSTA paths."""
+        path_sets = {
+            "max": self.report_all_timing_paths_by_split("max"),
+            "min": self.report_all_timing_paths_by_split("min"),
+        }
+        return build_reg2reg_timing_graph_from_split_paths(path_sets, include_paths=include_paths)
     
 import torch
 from torch.autograd import Function
@@ -454,13 +716,17 @@ class TimingOptFunction(Function):
             logging.info("HeteroSTA: Converting pos to CPU for CPU timing analysis")
             pos = pos.cpu()
         
-        # Calculate pin positions using pin_pos_op
+        # HeteroSTA RC extraction expects pin coordinates indexed in the same
+        # order used to build the NetlistDB.
+        logging.info("HeteroSTA forward: before pin_pos_op (use_cuda=%s pos_is_cuda=%s pos_numel=%d)", bool(use_cuda), pos.is_cuda, pos.numel())
         pin_pos = pin_pos_op(pos)
+        logging.info("HeteroSTA forward: after pin_pos_op (pin_pos_is_cuda=%s pin_pos_numel=%d)", pin_pos.is_cuda, pin_pos.numel())
         
         # Create slack output tensor if requested
         if slacks_rf is None:
             slacks_rf = torch.Tensor()
         
+        logging.info("HeteroSTA forward: before timing_hs_cpp.forward")
         timing_hs_cpp.forward(
             timer,
             pin_pos,
@@ -470,6 +736,7 @@ class TimingOptFunction(Function):
             scale_factor, lef_unit, def_unit,
             slacks_rf,
             ignore_net_degree, bool(use_cuda))
+        logging.info("HeteroSTA forward: after timing_hs_cpp.forward")
         
         return torch.zeros(num_pins)
 
@@ -484,7 +751,10 @@ class TimingOpt(nn.Module):
                  momentum_decay_factor,
                  scale_factor, lef_unit, def_unit,
                  pin_pos_op,
-                 ignore_net_degree, use_cuda=False):
+                 ignore_net_degree, use_cuda=False,
+                 useful_skew_weighting_flag=0,
+                 useful_skew_weighting_n=100,
+                 useful_skew_max_skew=50.0):
         """
         @brief Initialize the feedback module for HeteroSTA timing analysis
         @param timer the HeteroSTA timer object
@@ -526,9 +796,22 @@ class TimingOpt(nn.Module):
         self.net_criticality_deltas = net_criticality_deltas  # torch.Tensor
         self.net_weights = net_weights  # torch.Tensor (shared with data_collections)
         self.net_weight_deltas = net_weight_deltas  # torch.Tensor
+        self.net_criticality_cpu = net_criticality.detach().cpu().clone()
+        self.net_criticality_deltas_cpu = net_criticality_deltas.detach().cpu().clone()
+        self.net_weights_cpu = net_weights.detach().cpu().clone()
+        self.net_weight_deltas_cpu = net_weight_deltas.detach().cpu().clone()
         self.wire_resistance_per_micron = wire_resistance_per_micron
         self.wire_capacitance_per_micron = wire_capacitance_per_micron
         self.momentum_decay_factor = momentum_decay_factor
+        self.useful_skew_weighting_flag = bool(useful_skew_weighting_flag)
+        self.useful_skew_weighting_n = int(useful_skew_weighting_n)
+        if useful_skew_max_skew is None:
+            self.useful_skew_max_skew = None
+        else:
+            self.useful_skew_max_skew = float(useful_skew_max_skew)
+            if self.useful_skew_max_skew < 0:
+                self.useful_skew_max_skew = None
+        self.last_useful_skew_weighting_stats = {}
         
         # The scale factor is important, together with the lef/def unit.
         # Since we require the actual wire-length evaluation (microns) to
@@ -549,6 +832,29 @@ class TimingOpt(nn.Module):
         
         # Store the pin_pos_op passed from outside
         self.pin_pos_op = pin_pos_op
+
+    def _active_weight_tensors(self):
+        if self.use_cuda:
+            return (
+                self.net_criticality,
+                self.net_criticality_deltas,
+                self.net_weights,
+                self.net_weight_deltas,
+            )
+        return (
+            self.net_criticality_cpu,
+            self.net_criticality_deltas_cpu,
+            self.net_weights_cpu,
+            self.net_weight_deltas_cpu,
+        )
+
+    def _sync_active_weights_to_placement(self):
+        if self.use_cuda:
+            return
+        self.net_criticality.copy_(self.net_criticality_cpu.to(self.net_criticality.device))
+        self.net_criticality_deltas.copy_(self.net_criticality_deltas_cpu.to(self.net_criticality_deltas.device))
+        self.net_weights.copy_(self.net_weights_cpu.to(self.net_weights.device))
+        self.net_weight_deltas.copy_(self.net_weight_deltas_cpu.to(self.net_weight_deltas.device))
 
     def forward(self, pos):
         """
@@ -576,7 +882,11 @@ class TimingOpt(nn.Module):
         @param max_net_weight the maximum net weight in timing opt
         @param n the maximum number of paths to be reported
         """
+        if self.useful_skew_weighting_flag:
+            return self._update_net_weights_useful_skew(max_net_weight=max_net_weight, n=n)
+
         try:
+            active_net_criticality, active_net_criticality_deltas, active_net_weights, active_net_weight_deltas = self._active_weight_tensors()
             # Convert flat_netpin and netpin_start to tensors
             flat_netpin_t = torch.from_numpy(self.flat_netpin)
             netpin_start_t = torch.from_numpy(self.netpin_start)
@@ -607,19 +917,144 @@ class TimingOpt(nn.Module):
                 flat_netpin_t,
                 netpin_start_t,
                 pin2net_map_t,
-                self.net_criticality,  # GPU tensor - modified in-place
-                self.net_criticality_deltas,  # GPU tensor
-                self.net_weights,  # GPU tensor - modified in-place (shared with data_collections)
-                self.net_weight_deltas,  # GPU tensor
+                active_net_criticality,
+                active_net_criticality_deltas,
+                active_net_weights,
+                active_net_weight_deltas,
                 degree_map_t,
                 max_net_weight, self.momentum_decay_factor,
                 self.ignore_net_degree, bool(self.use_cuda))
 
-            # No need to copy back - tensors were modified in-place!
+            self._sync_active_weights_to_placement()
 
         except Exception as e:
             logging.error(f"HeteroSTA net weight update failed: {e}")
             raise  # Re-raise the exception so caller knows it failed
+
+    def _update_net_weights_useful_skew(self, max_net_weight=np.inf, n=1):
+        effective_n = max(1, min(int(n), self.useful_skew_weighting_n))
+        path_sets = {
+            "max": self.report_timing_paths_by_split("max", n=effective_n),
+            "min": self.report_timing_paths_by_split("min", n=effective_n),
+        }
+        graph = build_reg2reg_timing_graph_from_split_paths(path_sets, include_paths=True)
+        solution = solve_useful_skew(graph, max_skew=self.useful_skew_max_skew)
+
+        stats = {
+            "enabled": True,
+            "sampled_n": effective_n,
+            "path_counts": graph.get("path_counts"),
+            "num_registers": graph.get("num_registers"),
+            "num_edges": graph.get("num_edges"),
+            "max_skew": self.useful_skew_max_skew,
+            "skew_success": bool(solution.get("success")),
+            "skew_status": int(solution.get("status", -1)),
+            "skew_message": solution.get("message"),
+            "skew_margin": solution.get("margin"),
+        }
+
+        if not solution.get("success") or not _is_timing_number(solution.get("margin")):
+            logging.warning(
+                "HeteroSTA useful-skew weighting fallback to raw weighting: success=%s status=%s message=%s",
+                solution.get("success"),
+                solution.get("status"),
+                solution.get("message"),
+            )
+            stats["fallback_to_raw"] = True
+            self.last_useful_skew_weighting_stats = stats
+            return self._update_net_weights_raw(max_net_weight=max_net_weight, n=n)
+
+        skews = solution.get("skews", {})
+        net_slack_deltas = {}
+        raw_setup_wns = None
+        adjusted_setup_wns = None
+
+        for edge in graph.get("edges", []):
+            setup_slack = edge.get("setup_slack")
+            if not _is_timing_number(setup_slack):
+                continue
+
+            launch_skew = float(skews.get(edge["launch_register"], 0.0))
+            capture_skew = float(skews.get(edge["capture_register"], 0.0))
+            adjusted_setup_slack = float(setup_slack) + capture_skew - launch_skew
+
+            raw_setup_wns = float(setup_slack) if raw_setup_wns is None else min(raw_setup_wns, float(setup_slack))
+            adjusted_setup_wns = adjusted_setup_slack if adjusted_setup_wns is None else min(adjusted_setup_wns, adjusted_setup_slack)
+
+            setup_path = edge.get("setup_path")
+            if not setup_path:
+                continue
+
+            slack_delta = adjusted_setup_slack - float(setup_slack)
+
+            for net_id in _unique_path_net_ids(setup_path, self.pin2net_map):
+                previous = net_slack_deltas.get(net_id)
+                if previous is None or slack_delta < previous:
+                    net_slack_deltas[net_id] = slack_delta
+
+        adjusted_net_slacks = self.evaluate_net_slack()
+        affected_nets = 0
+        for net_id, delta in net_slack_deltas.items():
+            if 0 <= net_id < len(adjusted_net_slacks) and np.isfinite(float(adjusted_net_slacks[net_id])):
+                adjusted_net_slacks[net_id] = float(adjusted_net_slacks[net_id]) + float(delta)
+                affected_nets += 1
+
+        timing_hs_cpp.update_net_weights_lilith_with_net_slack(
+            self.timer.raw_timer,
+            self.num_nets,
+            self.net_criticality if self.use_cuda else self.net_criticality_cpu,
+            self.net_weights if self.use_cuda else self.net_weights_cpu,
+            torch.from_numpy(self.degree_map).to(self.net_weights.device if self.use_cuda else torch.device("cpu")),
+            torch.from_numpy(adjusted_net_slacks).to(self.net_weights.device if self.use_cuda else torch.device("cpu")),
+            self.momentum_decay_factor,
+            max_net_weight,
+            self.ignore_net_degree,
+            self.use_cuda,
+        )
+
+        stats["raw_setup_wns"] = raw_setup_wns
+        stats["adjusted_setup_wns"] = adjusted_setup_wns
+        stats["affected_nets"] = affected_nets
+        stats["fallback_to_raw"] = False
+        self.last_useful_skew_weighting_stats = stats
+        self._sync_active_weights_to_placement()
+        logging.info(
+            "HeteroSTA useful-skew weighting: n=%d edges=%d margin=%.3f raw_setup_wns=%s adjusted_setup_wns=%s affected_nets=%d max_skew=%s",
+            effective_n,
+            graph.get("num_edges", 0),
+            float(solution.get("margin")),
+            "None" if raw_setup_wns is None else f"{raw_setup_wns:.3f}",
+            "None" if adjusted_setup_wns is None else f"{adjusted_setup_wns:.3f}",
+            affected_nets,
+            self.useful_skew_max_skew,
+        )
+        return 0
+
+    def evaluate_net_slack(self):
+        slack = np.full(self.num_nets, np.inf, dtype=np.float32)
+        flat_netpin_t = torch.from_numpy(self.flat_netpin).to(self.net_weights.device if self.use_cuda else torch.device("cpu"))
+        netpin_start_t = torch.from_numpy(self.netpin_start).to(self.net_weights.device if self.use_cuda else torch.device("cpu"))
+        slack_t = torch.from_numpy(slack).to(self.net_weights.device if self.use_cuda else torch.device("cpu"))
+        timing_hs_cpp.evaluate_net_slack(
+            self.timer.raw_timer,
+            self.num_nets,
+            self.num_pins,
+            flat_netpin_t,
+            netpin_start_t,
+            slack_t,
+            self.use_cuda,
+        )
+        if self.use_cuda:
+            return slack_t.detach().cpu().numpy()
+        return slack
+
+    def _update_net_weights_raw(self, max_net_weight=np.inf, n=1):
+        old_flag = self.useful_skew_weighting_flag
+        self.useful_skew_weighting_flag = False
+        try:
+            return self.update_net_weights(max_net_weight=max_net_weight, n=n)
+        finally:
+            self.useful_skew_weighting_flag = old_flag
     
     def write_spef(self,file_path):
         return self.timer.raw_timer.write_spef(file_path)
@@ -669,4 +1104,28 @@ class TimingOpt(nn.Module):
         @param use_cuda whether to use CUDA
         """
         return self.timer.raw_timer.dump_paths_setup_to_file(num_paths, nworst, file_path, use_cuda)
+
+    def report_timing_paths_by_split(self, split, n=1):
+        """@brief report HeteroSTA timing paths with OpenTimer-like dictionaries."""
+        return self.timer.raw_timer.report_timing_paths_by_split(split, n, self.use_cuda)
+
+    def report_all_timing_paths_by_split(self, split):
+        """@brief report all available HeteroSTA timing paths for one split."""
+        return self.timer.raw_timer.report_all_timing_paths_by_split(split, self.use_cuda)
+
+    def export_reg2reg_timing_graph(self, n=None, include_paths=False):
+        """@brief export a register-to-register timing graph from HeteroSTA paths."""
+        path_sets = {
+            "max": self.report_timing_paths_by_split("max", n=n or 1),
+            "min": self.report_timing_paths_by_split("min", n=n or 1),
+        }
+        return build_reg2reg_timing_graph_from_split_paths(path_sets, include_paths=include_paths)
+
+    def export_full_reg2reg_timing_graph(self, include_paths=False):
+        """@brief export a register-to-register timing graph from all available HeteroSTA paths."""
+        path_sets = {
+            "max": self.report_all_timing_paths_by_split("max"),
+            "min": self.report_all_timing_paths_by_split("min"),
+        }
+        return build_reg2reg_timing_graph_from_split_paths(path_sets, include_paths=include_paths)
     

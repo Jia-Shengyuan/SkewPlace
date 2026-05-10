@@ -581,6 +581,16 @@ class BasicPlace(nn.Module):
             net_criticality_deltas_gpu = torch.from_numpy(placedb.net_criticality_deltas).to(device)
             net_weight_deltas_gpu = torch.from_numpy(placedb.net_weight_deltas).to(device)
 
+            heterosta_use_cuda = bool(getattr(params, "heterosta_use_cuda", 0))
+            timing_pin_pos_op = self.op_collections.pin_pos_op
+            if not heterosta_use_cuda:
+                timing_cpu_data = PlaceDataCollection(self.pos, params, placedb, torch.device("cpu"))
+                timing_pin_pos_op = self.build_pin_pos(
+                    params,
+                    placedb,
+                    timing_cpu_data,
+                    torch.device("cpu"),
+                )
             return timing_hs.TimingOpt(
                 timer,
                 placedb.net_names, # The net names are required by HeteroSTA.
@@ -600,12 +610,15 @@ class BasicPlace(nn.Module):
                 wire_resistance_per_micron=params.wire_resistance_per_micron,
                 wire_capacitance_per_micron=params.wire_capacitance_per_micron,
                 momentum_decay_factor=params.momentum_decay_factor,
+                useful_skew_weighting_flag=getattr(params, "useful_skew_weighting_flag", 0),
+                useful_skew_weighting_n=getattr(params, "useful_skew_weighting_n", 100),
+                useful_skew_max_skew=getattr(params, "useful_skew_max_skew", 50.0),
                 scale_factor=params.scale_factor,
                 lef_unit=placedb.rawdb.lefUnit(),
                 def_unit=placedb.rawdb.defUnit(),
-                pin_pos_op=self.op_collections.pin_pos_op,  # Pass the existing pin_pos_op
+                pin_pos_op=timing_pin_pos_op,
                 ignore_net_degree=params.ignore_net_degree,
-                use_cuda=params.gpu)  # Use params.gpu for CUDA setting
+                use_cuda=heterosta_use_cuda)
         else:
             # Use OpenTimer
             return timing.TimingOpt(

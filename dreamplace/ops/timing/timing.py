@@ -41,6 +41,7 @@ def _unique_path_net_ids(path, net_name2id_map):
         net_ids.append(net_id)
     return net_ids
 
+
 class TimingIO(Function):
     """
     @brief The timer we use will read some external files like celllibs,
@@ -308,7 +309,7 @@ class TimingOpt(nn.Module):
             )
 
         skews = solution.get("skews", {})
-        adjusted_net_slacks = {}
+        net_slack_deltas = {}
         raw_setup_wns = None
         adjusted_setup_wns = None
 
@@ -330,49 +331,53 @@ class TimingOpt(nn.Module):
             if not setup_path:
                 continue
 
+            slack_delta = adjusted_setup_slack - float(setup_slack)
+
             for net_id in _unique_path_net_ids(setup_path, self.net_name2id_map):
-                previous = adjusted_net_slacks.get(net_id)
-                if previous is None or adjusted_setup_slack < previous:
-                    adjusted_net_slacks[net_id] = adjusted_setup_slack
+                previous = net_slack_deltas.get(net_id)
+                if previous is None or slack_delta < previous:
+                    net_slack_deltas[net_id] = slack_delta
 
-        finite_max_weight = _is_number(max_net_weight)
+        affected_nets = 0
+        adjusted_net_slacks = self.evaluate_net_slack()
+        for net_id, entry in net_slack_deltas.items():
+            if 0 <= net_id < len(adjusted_net_slacks) and math.isfinite(float(adjusted_net_slacks[net_id])):
+                adjusted_net_slacks[net_id] = float(adjusted_net_slacks[net_id]) + float(entry)
+                affected_nets += 1
+
+        timing_cpp.update_net_weights_lilith_with_net_slack(
+            self.timer.raw_timer,
+            self.net_name2id_map,
+            torch.from_numpy(self.net_criticality),
+            torch.from_numpy(self.net_weights),
+            torch.from_numpy(self.degree_map),
+            torch.from_numpy(adjusted_net_slacks),
+            self.momentum_decay_factor,
+            max_net_weight,
+            self.ignore_net_degree,
+        )
+
+        wns = self.timer.report_wns()
         updated_nets = 0
-        for net_id in range(len(self.net_weights)):
-            if self.degree_map[net_id] > self.ignore_net_degree:
-                continue
-
-            nc = 0.0
-            adjusted_slack = adjusted_net_slacks.get(net_id)
-            if (
-                adjusted_slack is not None
-                and adjusted_setup_wns is not None
-                and adjusted_setup_wns < 0.0
-                and adjusted_slack < 0.0
-            ):
-                nc = max(0.0, float(adjusted_slack) / float(adjusted_setup_wns))
-                updated_nets += 1
-
-            self.net_criticality[net_id] = (
-                np.power(1.0 + self.net_criticality[net_id], self.momentum_decay_factor)
-                * np.power(1.0 + nc, 1.0 - self.momentum_decay_factor)
-                - 1.0
-            )
-            self.net_weights[net_id] *= (1.0 + self.net_criticality[net_id])
-            if finite_max_weight and self.net_weights[net_id] > max_net_weight:
-                self.net_weights[net_id] = max_net_weight
+        if wns is not None and math.isfinite(float(wns)) and float(wns) < 0:
+            updated_nets = int(np.count_nonzero(np.logical_and(np.isfinite(adjusted_net_slacks), adjusted_net_slacks < 0)))
+        else:
+            logging.warning("useful-skew lilith-compatible update saw invalid report_wns=%r", wns)
 
         stats["raw_setup_wns"] = raw_setup_wns
         stats["adjusted_setup_wns"] = adjusted_setup_wns
-        stats["affected_nets"] = updated_nets
+        stats["affected_nets"] = affected_nets
+        stats["updated_nets"] = updated_nets
         stats["fallback_to_raw"] = False
         self.last_useful_skew_weighting_stats = stats
         logging.info(
-            "useful-skew weighting: n=%d edges=%d margin=%.3f raw_setup_wns=%s adjusted_setup_wns=%s affected_nets=%d max_skew=%s",
+            "useful-skew lilith-compatible weighting: n=%d edges=%d margin=%.3f raw_setup_wns=%s adjusted_setup_wns=%s affected_nets=%d updated_nets=%d max_skew=%s",
             effective_n,
             graph.get("num_edges", 0),
             float(solution.get("margin")),
             "None" if raw_setup_wns is None else f"{raw_setup_wns:.3f}",
             "None" if adjusted_setup_wns is None else f"{adjusted_setup_wns:.3f}",
+            affected_nets,
             updated_nets,
             self.useful_skew_max_skew,
         )
@@ -387,5 +392,17 @@ class TimingOpt(nn.Module):
         timing_cpp.evaluate_slack(
             self.timer.raw_timer,
             self.pin_name2id_map,
+            torch.from_numpy(slack))
+        return slack
+
+    def evaluate_net_slack(self):
+        """
+        @brief evaluate the slack array of nets using native lilith semantics
+        """
+        num_nets = self.net_names.shape[0]
+        slack = np.full(num_nets, np.inf, dtype=np.float32)
+        timing_cpp.evaluate_net_slack(
+            self.timer.raw_timer,
+            self.net_name2id_map,
             torch.from_numpy(slack))
         return slack

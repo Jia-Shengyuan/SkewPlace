@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+import traceback
 
 import numpy as np
 
@@ -51,18 +52,63 @@ def _clock_period_ps(sdc_path):
 def _final_placement_metrics(metrics):
     if not metrics:
         return {}
-    last = metrics[-1]
+
+    flat_metrics = []
+
+    def _collect(items):
+        if items is None:
+            return
+        if isinstance(items, (list, tuple)):
+            for item in items:
+                _collect(item)
+            return
+        flat_metrics.append(items)
+
+    _collect(metrics)
+    if not flat_metrics:
+        return {}
+
+    def _last_value(field):
+        for metric in reversed(flat_metrics):
+            value = getattr(metric, field, None)
+            if value is not None:
+                return _scalar_to_float(value)
+        return None
+
     return {
-        "objective": _scalar_to_float(getattr(last, "objective", None)) if getattr(last, "objective", None) is not None else None,
-        "hpwl": _scalar_to_float(getattr(last, "hpwl", None)) if getattr(last, "hpwl", None) is not None else None,
-        "overflow": _scalar_to_float(getattr(last, "overflow", None)) if getattr(last, "overflow", None) is not None else None,
-        "max_density": _scalar_to_float(getattr(last, "max_density", None)) if getattr(last, "max_density", None) is not None else None,
-        "tns": _scalar_to_float(getattr(last, "tns", None)) if getattr(last, "tns", None) is not None else None,
-        "wns": _scalar_to_float(getattr(last, "wns", None)) if getattr(last, "wns", None) is not None else None,
+        "objective": _last_value("objective"),
+        "hpwl": _last_value("hpwl"),
+        "overflow": _last_value("overflow"),
+        "max_density": _last_value("max_density"),
+        "tns": _last_value("tns"),
+        "wns": _last_value("wns"),
     }
 
 
-def run(config_path, iterations=520, use_skew=False, skew_n=100, max_skew=50.0):
+def _build_summary(params, timer, iterations, use_skew, skew_n, max_skew, clock_period_ps):
+    return {
+        "design": params.design_name(),
+        "iterations": iterations,
+        "clock_period_ps": clock_period_ps,
+        "clock_frequency_mhz": None if clock_period_ps in (None, 0) else 1.0e6 / clock_period_ps,
+        "useful_skew_weighting_flag": bool(use_skew),
+        "useful_skew_weighting_n": skew_n,
+        "useful_skew_max_skew": max_skew,
+        "timer_engine": timer.timer_engine,
+        "heterosta_use_cuda": bool(getattr(params, "heterosta_use_cuda", 0)),
+    }
+
+
+def _emit_summary(summary, output_path=None):
+    text = json.dumps(summary, indent=2)
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.write("\n")
+    print(text)
+
+
+def run(config_path, iterations=520, use_skew=False, skew_n=100, max_skew=50.0, output_path=None):
     params = Params.Params()
     params.load(config_path)
 
@@ -79,6 +125,12 @@ def run(config_path, iterations=520, use_skew=False, skew_n=100, max_skew=50.0):
     params.useful_skew_weighting_flag = 1 if use_skew else 0
     params.useful_skew_weighting_n = skew_n
     params.useful_skew_max_skew = max_skew
+    useful_skew_schedule_override = os.environ.get("DREAMPLACE_USEFUL_SKEW_SCHEDULE")
+    if useful_skew_schedule_override is not None:
+        params.useful_skew_schedule = useful_skew_schedule_override
+    heterosta_use_cuda_override = os.environ.get("HETEROSTA_USE_CUDA")
+    if heterosta_use_cuda_override is not None:
+        params.heterosta_use_cuda = int(heterosta_use_cuda_override)
 
     np.random.seed(params.random_seed)
 
@@ -92,26 +144,37 @@ def run(config_path, iterations=520, use_skew=False, skew_n=100, max_skew=50.0):
 
     learning_rate_value = params.__dict__.get("global_place_stages")[0].get("learning_rate")
     placer = NonLinearPlace.NonLinearPlace(params, placedb, timer)
+    clock_period_ps = _clock_period_ps(params.sdc_input)
+    summary = _build_summary(params, timer, iterations, use_skew, skew_n, max_skew, clock_period_ps)
 
     begin = time.time()
-    metrics = placer(params, placedb, learning_rate_value)
-    elapsed = time.time() - begin
-    clock_period_ps = _clock_period_ps(params.sdc_input)
+    try:
+        metrics = placer(params, placedb, learning_rate_value)
+        summary.update(
+            {
+                "runtime_sec": time.time() - begin,
+                "stopped_due_to_error": False,
+                "placement_metrics": _final_placement_metrics(metrics),
+                "weighting_stats": getattr(placer.op_collections.timing_op, "last_useful_skew_weighting_stats", {}),
+            }
+        )
+    except Exception as exc:
+        summary.update(
+            {
+                "runtime_sec": time.time() - begin,
+                "stopped_due_to_error": True,
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+                "placement_metrics": None,
+                "weighting_stats": getattr(placer.op_collections.timing_op, "last_useful_skew_weighting_stats", {}),
+            }
+        )
 
-    summary = {
-        "design": params.design_name(),
-        "iterations": iterations,
-        "clock_period_ps": clock_period_ps,
-        "clock_frequency_mhz": None if clock_period_ps in (None, 0) else 1.0e6 / clock_period_ps,
-        "useful_skew_weighting_flag": bool(use_skew),
-        "useful_skew_weighting_n": skew_n,
-        "useful_skew_max_skew": max_skew,
-        "timer_engine": timer.timer_engine,
-        "runtime_sec": elapsed,
-        "placement_metrics": _final_placement_metrics(metrics),
-        "weighting_stats": getattr(placer.op_collections.timing_op, "last_useful_skew_weighting_stats", {}),
-    }
-    print(json.dumps(summary, indent=2))
+    _emit_summary(summary, output_path=output_path)
+    return summary
 
 
 if __name__ == "__main__":
@@ -126,7 +189,7 @@ if __name__ == "__main__":
     )
     if len(sys.argv) < 2:
         raise SystemExit(
-            "usage: python run_skew_timing_feedback_summary.py <json> [iterations] [use_skew] [skew_n] [max_skew]"
+            "usage: python run_skew_timing_feedback_summary.py <json> [iterations] [use_skew] [skew_n] [max_skew] [output_json]"
         )
 
     config_path = sys.argv[1]
@@ -134,4 +197,14 @@ if __name__ == "__main__":
     use_skew = bool(int(sys.argv[3])) if len(sys.argv) >= 4 else False
     skew_n = int(sys.argv[4]) if len(sys.argv) >= 5 else 100
     max_skew = float(sys.argv[5]) if len(sys.argv) >= 6 else 50.0
-    run(config_path, iterations=iterations, use_skew=use_skew, skew_n=skew_n, max_skew=max_skew)
+    output_path = sys.argv[6] if len(sys.argv) >= 7 else None
+    summary = run(
+        config_path,
+        iterations=iterations,
+        use_skew=use_skew,
+        skew_n=skew_n,
+        max_skew=max_skew,
+        output_path=output_path,
+    )
+    if summary.get("stopped_due_to_error"):
+        raise SystemExit(1)

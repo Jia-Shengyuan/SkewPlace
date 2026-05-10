@@ -59,6 +59,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
         optimizers_list = ["sgd", "sgd_momentum", "sgd_nesterov", "adam", "adamax", "nadam", "adamw", "adadelta", "rmsprop", "aggmo", "qhadam", "yogi", "radam", "adabelief", "adabound", "adafactor", "diffgrad", "novograd", "cg_fr", "cg_prp", "cg_hs", "cg_cd", "cg_ls", "cg_dy", "cg_hz", "cg_hs-dy"]
         
         iteration = 0
+        gp_iteration_offset = int(getattr(params, "global_place_iteration_offset", 0) or 0)
         all_metrics = []
         if params.timing_opt_flag:
             timing_op = self.op_collections.timing_op
@@ -378,6 +379,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                     Lgamma_step, Llambda_density_weight_step, Lsub_step, iteration, metrics, stop_mask=None
                 ):
                     t0 = time.time()
+                    absolute_iteration = gp_iteration_offset + iteration
 
                     # metric for this iteration
                     cur_metric = EvalMetrics.EvalMetrics(
@@ -462,7 +464,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                       # Perform timing-opt.
                     if params.global_place_flag and params.timing_opt_flag and \
                         params.enable_net_weighting and \
-                        iteration > 500 and iteration % 15 == 0:
+                        absolute_iteration > 500 and absolute_iteration % 15 == 0:
                         # Take the timing operator from the operator collections.
                         cur_pos = self.pos[0].data.clone().cpu().numpy()
                         # The timing operator has already integrated timer as its
@@ -476,6 +478,34 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                             timing_op.timer.update_timing()
                             
                         npaths = max(1, int(placedb.num_nets * 0.03))
+
+                        useful_skew_schedule = getattr(params, "useful_skew_schedule", "fixed")
+                        if getattr(timing_op, "useful_skew_weighting_flag", False):
+                            target_max_skew = float(getattr(params, "useful_skew_max_skew", 0.0))
+                            effective_max_skew = target_max_skew
+                            if useful_skew_schedule == "growing" and target_max_skew > 0:
+                                total_iterations = int(
+                                    getattr(
+                                        params,
+                                        "global_place_total_iterations",
+                                        gp_iteration_offset + int(global_place_params["iteration"]),
+                                    )
+                                )
+                                if total_iterations - 1 >= 510:
+                                    total_feedbacks = ((total_iterations - 1) - 510) // 15 + 1
+                                else:
+                                    total_feedbacks = 1
+                                feedback_index = ((absolute_iteration - 510) // 15) + 1
+                                effective_max_skew = target_max_skew * float(feedback_index) / float(max(1, total_feedbacks))
+                                logging.info(
+                                    "timing feedback iter=%d: growing skew schedule feedback=%d/%d target_max_skew=%g effective_max_skew=%g",
+                                    absolute_iteration,
+                                    feedback_index,
+                                    total_feedbacks,
+                                    target_max_skew,
+                                    effective_max_skew,
+                                )
+                            timing_op.useful_skew_max_skew = effective_max_skew
 
                         # Report timing step.
                         # Temporary solution: modify net weights
@@ -520,7 +550,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                             int(item) for item in checkpoint_steps.split(",") if item.strip()
                         ]
                     checkpoint_steps = set(int(item) for item in checkpoint_steps)
-                    if iteration in checkpoint_steps:
+                    if absolute_iteration in checkpoint_steps:
                         checkpoint_dir = os.path.join(
                             params.result_dir,
                             params.design_name(),
@@ -529,7 +559,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                         os.makedirs(checkpoint_dir, exist_ok=True)
                         checkpoint_file = os.path.join(
                             checkpoint_dir,
-                            "%s.iter%d.gp.pklz" % (params.design_name(), iteration),
+                            "%s.iter%d.gp.pklz" % (params.design_name(), absolute_iteration),
                         )
                         self.dump(params, placedb, self.pos[0].cpu(), checkpoint_file)
                         logging.info("dumped global placement checkpoint to %s", checkpoint_file)

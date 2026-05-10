@@ -5,6 +5,9 @@
 #include <chrono>
 #include <fstream>
 
+#ifdef CUDA_FOUND
+#include <cuda_runtime_api.h>
+#endif
 
 DREAMPLACE_BEGIN_NAMESPACE
 
@@ -26,6 +29,81 @@ void updateNetWeightCudaLauncher(
     T momentum_decay_factor,
     T max_net_weight,
     int ignore_net_degree);
+
+template <typename T>
+void evaluateNetSlackCudaLauncher(
+    STAHoldings* sta,
+    int num_nets,
+    int num_pins,
+    const int* flat_netpin,
+    const int* netpin_start,
+    T* net_slack);
+
+template <typename T>
+void updateNetWeightsLilithWithNetSlackCudaLauncher(
+    STAHoldings* sta,
+    int num_nets,
+    T* net_criticality,
+    T* net_weights,
+    const int* degree_map,
+    const T* net_slack,
+    T momentum_decay_factor,
+    T max_net_weight,
+    int ignore_net_degree);
+
+namespace {
+
+class ScopedCudaDevice {
+ public:
+  ScopedCudaDevice(const torch::Tensor& tensor, bool enabled)
+      : active_(false), previous_device_(-1) {
+    if (!enabled || !tensor.defined() || !tensor.is_cuda()) {
+      return;
+    }
+
+    const int target_device = tensor.get_device();
+    if (target_device < 0) {
+      return;
+    }
+
+    cudaError_t status = cudaGetDevice(&previous_device_);
+    if (status != cudaSuccess) {
+      dreamplacePrint(kWARN, "cudaGetDevice failed before HeteroSTA call: %s\n", cudaGetErrorString(status));
+      previous_device_ = -1;
+    }
+
+    if (previous_device_ == target_device) {
+      return;
+    }
+
+    status = cudaSetDevice(target_device);
+    if (status != cudaSuccess) {
+      dreamplacePrint(
+          kWARN,
+          "cudaSetDevice(%d) failed before HeteroSTA call: %s\n",
+          target_device,
+          cudaGetErrorString(status));
+      return;
+    }
+    active_ = true;
+  }
+
+  ~ScopedCudaDevice() {
+    if (!active_ || previous_device_ < 0) {
+      return;
+    }
+    cudaError_t status = cudaSetDevice(previous_device_);
+    if (status != cudaSuccess) {
+      dreamplacePrint(kWARN, "cudaSetDevice restore failed after HeteroSTA call: %s\n", cudaGetErrorString(status));
+    }
+  }
+
+ private:
+  bool active_;
+  int previous_device_;
+};
+
+}  // namespace
 #endif
 
 
@@ -100,10 +178,10 @@ int timingHeterostaCppLauncher(
 
 	dreamplacePrint(kINFO,"finish state updates...\n");
 
-	static_assert(sizeof(bool) == 1);
-	static std::vector<uint8_t> timingpin_is_endpoint;
-	timingpin_is_endpoint.resize(num_pins);
-	heterosta_get_is_endpoint(&sta, (bool *) timingpin_is_endpoint.data());
+	// Avoid endpoint bitmap probing here as well. The current HeteroSTA
+	// library can panic in heterosta_get_is_endpoint on large ICCAD2015
+	// designs, while the timing update path itself does not require this
+	// debug-side endpoint scan.
 	//heterosta_launch_debug_shell(&sta);
 
 	// Report pin slacks
@@ -111,15 +189,7 @@ int timingHeterostaCppLauncher(
 	{
 		heterosta_report_slacks_at_max(&sta, slacks_rf, use_cuda);
 		dreamplacePrint(kDEBUG, "HeteroSTA slack report completed\n");
-		dreamplacePrint(kDEBUG, "Sample slacks (rise/fall) for first 10 endpoints:\n");
-		int endpoint_count = 0;
-		for (size_t i = 0; i < num_pins && endpoint_count < 10; ++i) {
-			if (timingpin_is_endpoint[i]) {
-				dreamplacePrint(kDEBUG, "  Endpoint Pin %s (%zu): Rise=%.3f, Fall=%.3f\n",
-						TimingHeterostaIO::getPinName(i), i, slacks_rf[i][0], slacks_rf[i][1]);
-				endpoint_count++;
-			}
-		}
+		dreamplacePrint(kDEBUG, "Skipping endpoint-wise slack dump because endpoint probing is disabled.\n");
 	}
 	auto end = std::chrono::steady_clock::now();
 	auto usc = std::chrono::duration_cast<std::chrono::milliseconds>(end - beg);
@@ -152,6 +222,15 @@ void TimingHeterostaCpp::forward(
 		float* slacks_rf_data = slacks_rf.data_ptr<float>();
 		slacks_rf_ptr = reinterpret_cast<float (*)[2]>(slacks_rf_data);
 	}
+
+#ifdef CUDA_FOUND
+	if (use_cuda && pos.is_cuda()) {
+		auto target_device = static_cast<uint8_t>(pos.get_device());
+		heterosta_set_cuda_device_id(&sta, target_device);
+		dreamplacePrint(kDEBUG, "Set HeteroSTA CUDA device to %u before timing forward\n", target_device);
+	}
+	ScopedCudaDevice device_guard(pos, use_cuda);
+#endif
 
 	DREAMPLACE_DISPATCH_FLOATING_TYPES(
 			pos, "timingHeterostaCppLauncher",
@@ -280,6 +359,15 @@ void TimingHeterostaCpp::update_net_weights(
 	CHECK_CONTIGUOUS(net_weight_deltas);
 	CHECK_CONTIGUOUS(degree_map);
 
+#ifdef CUDA_FOUND
+	if (use_cuda && net_weights.is_cuda()) {
+		auto target_device = static_cast<uint8_t>(net_weights.get_device());
+		heterosta_set_cuda_device_id(&sta, target_device);
+		dreamplacePrint(kDEBUG, "Set HeteroSTA CUDA device to %u before net weight update\n", target_device);
+	}
+	ScopedCudaDevice device_guard(net_weights, use_cuda);
+#endif
+
 	if (use_cuda) {
 #ifdef CUDA_FOUND
         DREAMPLACE_DISPATCH_FLOATING_TYPES(
@@ -327,6 +415,161 @@ void TimingHeterostaCpp::update_net_weights(
 			});
 	}
 
+}
+
+template <typename T>
+void evaluateNetSlackCppLauncher(
+		STAHoldings& sta,
+		int num_nets,
+		int num_pins,
+		const int* flat_netpin,
+		const int* netpin_start,
+		T* net_slack) {
+	static std::vector<float> slack_data;
+	if (slack_data.size() < num_pins * 2) {
+		slack_data.resize(num_pins * 2);
+	}
+	float (*slack_array)[2] = reinterpret_cast<float(*)[2]>(slack_data.data());
+	heterosta_report_slacks_at_max(&sta, slack_array, false);
+
+	for (int net_i = 0; net_i < num_nets; ++net_i) {
+		float value = std::numeric_limits<float>::max();
+		for (int np_i = netpin_start[net_i]; np_i < netpin_start[net_i + 1]; ++np_i) {
+			int pin_i = flat_netpin[np_i];
+			if (pin_i < 0 || pin_i >= num_pins) {
+				continue;
+			}
+			float pin_worst_slack = std::min(slack_array[pin_i][0], slack_array[pin_i][1]);
+			value = std::min(value, pin_worst_slack);
+		}
+		net_slack[net_i] = static_cast<T>(value);
+	}
+}
+
+void TimingHeterostaCpp::evaluate_net_slack(
+		STAHoldings& sta,
+		int num_nets,
+		int num_pins,
+		torch::Tensor flat_netpin,
+		torch::Tensor netpin_start,
+		torch::Tensor slack,
+		bool use_cuda) {
+	CHECK_CONTIGUOUS(flat_netpin);
+	CHECK_CONTIGUOUS(netpin_start);
+	CHECK_CONTIGUOUS(slack);
+
+	if (use_cuda) {
+		DREAMPLACE_DISPATCH_FLOATING_TYPES(
+				slack, "evaluateNetSlackCudaLauncher",
+				[&] {
+				evaluateNetSlackCudaLauncher<scalar_t>(
+						&sta,
+						num_nets,
+						num_pins,
+						DREAMPLACE_TENSOR_DATA_PTR(flat_netpin, int),
+						DREAMPLACE_TENSOR_DATA_PTR(netpin_start, int),
+						DREAMPLACE_TENSOR_DATA_PTR(slack, scalar_t));
+				});
+		return;
+	}
+
+	DREAMPLACE_DISPATCH_FLOATING_TYPES(
+			slack, "evaluateNetSlackCppLauncher",
+			[&] {
+			evaluateNetSlackCppLauncher<scalar_t>(
+					sta,
+					num_nets,
+					num_pins,
+					DREAMPLACE_TENSOR_DATA_PTR(flat_netpin, int),
+					DREAMPLACE_TENSOR_DATA_PTR(netpin_start, int),
+					DREAMPLACE_TENSOR_DATA_PTR(slack, scalar_t));
+			});
+}
+
+template <typename T>
+void updateNetWeightsLilithWithNetSlackCppLauncher(
+		STAHoldings& sta,
+		int num_nets,
+		T* net_criticality,
+		T* net_weights,
+		const int* degree_map,
+		const T* net_slack,
+		T momentum_decay_factor,
+		T max_net_weight,
+		int ignore_net_degree,
+		bool use_cuda) {
+	float wns = 0.0f;
+	float tns = 0.0f;
+	bool success = heterosta_report_wns_tns_max(&sta, &wns, &tns, use_cuda);
+	if (!success) {
+		dreamplacePrint(kWARN, "report_wns_tns_max failed; skip lilith-with-net-slack update\n");
+		return;
+	}
+
+	for (int net_i = 0; net_i < num_nets; ++net_i) {
+		float slack = static_cast<float>(net_slack[net_i]);
+		if (wns < 0) {
+			float nc = (slack < 0) ? std::max(0.f, slack / wns) : 0.f;
+			net_criticality[net_i] = std::pow(1 + net_criticality[net_i], momentum_decay_factor) *
+				std::pow(1 + nc, 1 - momentum_decay_factor) - 1;
+		}
+		if (degree_map[net_i] > ignore_net_degree) continue;
+		net_weights[net_i] *= (1 + net_criticality[net_i]);
+		if (net_weights[net_i] > max_net_weight) {
+			net_weights[net_i] = max_net_weight;
+		}
+	}
+}
+
+void TimingHeterostaCpp::update_net_weights_lilith_with_net_slack(
+		STAHoldings& sta,
+		int num_nets,
+		torch::Tensor net_criticality,
+		torch::Tensor net_weights,
+		torch::Tensor degree_map,
+		torch::Tensor net_slack,
+		double momentum_decay_factor,
+		double max_net_weight,
+		int ignore_net_degree,
+		bool use_cuda) {
+	CHECK_CONTIGUOUS(net_criticality);
+	CHECK_CONTIGUOUS(net_weights);
+	CHECK_CONTIGUOUS(degree_map);
+	CHECK_CONTIGUOUS(net_slack);
+
+	if (use_cuda) {
+		DREAMPLACE_DISPATCH_FLOATING_TYPES(
+				net_weights, "updateNetWeightsLilithWithNetSlackCudaLauncher",
+				[&] {
+				updateNetWeightsLilithWithNetSlackCudaLauncher<scalar_t>(
+						&sta,
+						num_nets,
+						DREAMPLACE_TENSOR_DATA_PTR(net_criticality, scalar_t),
+						DREAMPLACE_TENSOR_DATA_PTR(net_weights, scalar_t),
+						DREAMPLACE_TENSOR_DATA_PTR(degree_map, int),
+						DREAMPLACE_TENSOR_DATA_PTR(net_slack, scalar_t),
+						static_cast<scalar_t>(momentum_decay_factor),
+						static_cast<scalar_t>(max_net_weight),
+						ignore_net_degree);
+				});
+		return;
+	}
+
+	DREAMPLACE_DISPATCH_FLOATING_TYPES(
+			net_weights, "updateNetWeightsLilithWithNetSlackCppLauncher",
+			[&] {
+			updateNetWeightsLilithWithNetSlackCppLauncher<scalar_t>(
+					sta,
+					num_nets,
+					DREAMPLACE_TENSOR_DATA_PTR(net_criticality, scalar_t),
+					DREAMPLACE_TENSOR_DATA_PTR(net_weights, scalar_t),
+					DREAMPLACE_TENSOR_DATA_PTR(degree_map, int),
+					DREAMPLACE_TENSOR_DATA_PTR(net_slack, scalar_t),
+					static_cast<scalar_t>(momentum_decay_factor),
+					static_cast<scalar_t>(max_net_weight),
+					ignore_net_degree,
+					use_cuda);
+			});
 }
 
 DREAMPLACE_END_NAMESPACE

@@ -22,3 +22,8 @@ opencode.log
 benchmarks/*.tar
 benchmarks/*.tar.*
 benchmarks/iccad2015.ot/
+.opencode_tmp*
+benchmarks/iccad2015.hs/
+heterosta_license
+server.txt
+{log_path}

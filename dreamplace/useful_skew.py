@@ -36,7 +36,7 @@ def _filter_test_paths(paths):
 
 
 def _pin_suffix(point):
-    return point.get("pin_name", "").rsplit(":", 1)[-1]
+    return point.get("pin_name", "").replace("/", ":").rsplit(":", 1)[-1]
 
 
 def _is_clock_pin(point):
@@ -94,7 +94,14 @@ def _path_to_edge(path, include_path):
         return None
 
     points = path.get("points", [])
-    launch_point = _find_launch_point(points, path.get("capture_gate_name", ""))
+    if path.get("launch_gate_name"):
+        launch_point = {
+            "gate_name": path.get("launch_gate_name", ""),
+            "cell_name": path.get("launch_cell_name", ""),
+            "pin_name": path.get("launch_pin_name", ""),
+        }
+    else:
+        launch_point = _find_launch_point(points, path.get("capture_gate_name", ""))
     capture_point = {
         "gate_name": path.get("capture_gate_name", ""),
         "cell_name": path.get("capture_cell_name", ""),
@@ -170,8 +177,17 @@ def _merge_edge(existing_edge, candidate_edge, include_paths):
             existing_edge[field] = candidate_edge[field]
 
     if _is_number(candidate_edge.get("setup_delay")):
-        if (not _is_number(existing_edge.get("setup_delay")) or
-                candidate_edge["setup_delay"] > existing_edge["setup_delay"]):
+        candidate_setup_slack = candidate_edge.get("slack")
+        existing_setup_slack = existing_edge.get("setup_slack")
+        prefer_candidate = False
+        if _is_number(candidate_setup_slack):
+            prefer_candidate = (not _is_number(existing_setup_slack) or
+                                float(candidate_setup_slack) < float(existing_setup_slack))
+        else:
+            prefer_candidate = (not _is_number(existing_edge.get("setup_delay")) or
+                                candidate_edge["setup_delay"] > existing_edge["setup_delay"])
+
+        if prefer_candidate:
             existing_edge["setup_delay"] = candidate_edge["setup_delay"]
             existing_edge["setup_constraint"] = candidate_edge.get("setup_constraint")
             existing_edge["setup_slack"] = candidate_edge.get("slack")
@@ -183,8 +199,17 @@ def _merge_edge(existing_edge, candidate_edge, include_paths):
                 existing_edge["setup_path"] = candidate_edge.get("path")
 
     if _is_number(candidate_edge.get("hold_delay")):
-        if (not _is_number(existing_edge.get("hold_delay")) or
-                candidate_edge["hold_delay"] < existing_edge["hold_delay"]):
+        candidate_hold_slack = candidate_edge.get("slack")
+        existing_hold_slack = existing_edge.get("hold_slack")
+        prefer_candidate = False
+        if _is_number(candidate_hold_slack):
+            prefer_candidate = (not _is_number(existing_hold_slack) or
+                                float(candidate_hold_slack) < float(existing_hold_slack))
+        else:
+            prefer_candidate = (not _is_number(existing_edge.get("hold_delay")) or
+                                candidate_edge["hold_delay"] < existing_edge["hold_delay"])
+
+        if prefer_candidate:
             existing_edge["hold_delay"] = candidate_edge["hold_delay"]
             existing_edge["hold_constraint"] = candidate_edge.get("hold_constraint")
             existing_edge["hold_slack"] = candidate_edge.get("slack")

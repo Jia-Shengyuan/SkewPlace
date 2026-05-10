@@ -348,11 +348,11 @@ bool TimingHeterostaIO::buildTimerDB(STAHoldings& sta, NetlistDB* netlistdb) {
 	size_t num_pins = g_netlist_data.pin_names.size();
 	dreamplacePrint(kINFO, " Pin count: %zu\n", num_pins);
 
-	// Step 6: Initialize and identify timing endpoints
-	static_assert(sizeof(bool) == 1);
-	std::vector<uint8_t> timingpin_is_endpoint;
-	timingpin_is_endpoint.resize(num_pins);
-	heterosta_get_is_endpoint(&sta, (bool *) timingpin_is_endpoint.data());
+	// Step 6: Skip endpoint probing here.
+	// The current HeteroSTA build can panic inside heterosta_get_is_endpoint
+	// on ICCAD2015 superblue1 even after the STA object is created
+	// successfully. The placement flow does not require endpoint bitmap
+	// construction at initialization time, so avoid this debug-only query.
 
 	dreamplacePrint(kINFO, "Timer database built successfully\n");
 	return true;
@@ -576,7 +576,17 @@ const char* hardcode_lic = nullptr;
 TimingHeterostaIO::STAHoldingsPtr TimingHeterostaIO::initialize_heterosta() {
 
 	dreamplacePrint(kINFO, "HeteroSTA instance created successfully\n");
-	heterosta_init_logger(dreamplace_heterosta_print_callback);
+	const char* enable_logger_env = std::getenv("DREAMPLACE_HETEROSTA_ENABLE_LOGGER");
+	bool enable_logger = enable_logger_env != nullptr && enable_logger_env[0] != '\0' && std::strcmp(enable_logger_env, "0") != 0;
+	if (enable_logger) {
+		heterosta_init_logger(dreamplace_heterosta_print_callback);
+		dreamplacePrint(kINFO, "HeteroSTA logger callback enabled via DREAMPLACE_HETEROSTA_ENABLE_LOGGER.\n");
+	} else {
+		// The current GPU HeteroSTA build can panic in heterosta_new after a
+		// logger callback is registered, even before the timer database is built.
+		// Keep the callback opt-in so timing initialization remains usable.
+		dreamplacePrint(kWARN, "HeteroSTA logger callback disabled by default due to heterosta_new instability; set DREAMPLACE_HETEROSTA_ENABLE_LOGGER=1 to re-enable.\n");
+	}
     const char* lic = std::getenv("HeteroSTA_Lic");
     bool have_env = (lic != nullptr) && (lic[0] != '\0');
     if (have_env) {
@@ -618,6 +628,10 @@ const char* TimingHeterostaIO::getPinName(size_t pin_index) {
 
 size_t TimingHeterostaIO::getPinCount() {
 	return g_netlist_data.pin_names.size();
+}
+
+size_t TimingHeterostaIO::getCellCount() {
+	return g_netlist_data.cell_names.size();
 }
 
 DREAMPLACE_END_NAMESPACE

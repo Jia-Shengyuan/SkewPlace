@@ -59,6 +59,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
         optimizers_list = ["sgd", "sgd_momentum", "sgd_nesterov", "adam", "adamax", "nadam", "adamw", "adadelta", "rmsprop", "aggmo", "qhadam", "yogi", "radam", "adabelief", "adabound", "adafactor", "diffgrad", "novograd", "cg_fr", "cg_prp", "cg_hs", "cg_cd", "cg_ls", "cg_dy", "cg_hz", "cg_hs-dy"]
         
         iteration = 0
+        gp_iteration_offset = int(getattr(params, "global_place_iteration_offset", 0) or 0)
         all_metrics = []
         if params.timing_opt_flag:
             timing_op = self.op_collections.timing_op
@@ -378,6 +379,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                     Lgamma_step, Llambda_density_weight_step, Lsub_step, iteration, metrics, stop_mask=None
                 ):
                     t0 = time.time()
+                    absolute_iteration = gp_iteration_offset + iteration
 
                     # metric for this iteration
                     cur_metric = EvalMetrics.EvalMetrics(
@@ -462,28 +464,71 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                       # Perform timing-opt.
                     if params.global_place_flag and params.timing_opt_flag and \
                         params.enable_net_weighting and \
-                        iteration > 500 and iteration % 15 == 0:
+                        absolute_iteration > 500 and absolute_iteration % 15 == 0:
                         # Take the timing operator from the operator collections.
                         cur_pos = self.pos[0].data.clone().cpu().numpy()
                         # The timing operator has already integrated timer as its
                         # instance variable, so it only takes one argument.
                         # HeteroSTA can use GPU tensors directly, OpenTimer needs CPU
                         timing_beg = time.time()
+                        logging.info(
+                            "timing feedback start: iter=%d engine=%s heterosta_use_cuda=%s",
+                            absolute_iteration,
+                            params.timer_engine,
+                            getattr(timing_op, "use_cuda", False),
+                        )
                         if params.timer_engine == "heterosta":
-                            timing_op(self.pos[0].data.clone())
+                            timing_pos = self.pos[0].data.clone() if getattr(timing_op, "use_cuda", False) else self.pos[0].data.clone().cpu()
+                            logging.info("timing feedback iter=%d: before timing_op", absolute_iteration)
+                            timing_op(timing_pos)
+                            logging.info("timing feedback iter=%d: after timing_op", absolute_iteration)
                         else:
+                            logging.info("timing feedback iter=%d: before timing_op", absolute_iteration)
                             timing_op(self.pos[0].data.clone().cpu())
+                            logging.info("timing feedback iter=%d: after timing_op", absolute_iteration)
+                            logging.info("timing feedback iter=%d: before update_timing", absolute_iteration)
                             timing_op.timer.update_timing()
+                            logging.info("timing feedback iter=%d: after update_timing", absolute_iteration)
                             
                         npaths = max(1, int(placedb.num_nets * 0.03))
+
+                        useful_skew_schedule = getattr(params, "useful_skew_schedule", "fixed")
+                        if getattr(timing_op, "useful_skew_weighting_flag", False):
+                            target_max_skew = float(getattr(params, "useful_skew_max_skew", 0.0))
+                            effective_max_skew = target_max_skew
+                            if useful_skew_schedule == "growing" and target_max_skew > 0:
+                                total_iterations = int(
+                                    getattr(
+                                        params,
+                                        "global_place_total_iterations",
+                                        gp_iteration_offset + int(global_place_params["iteration"]),
+                                    )
+                                )
+                                if total_iterations - 1 >= 510:
+                                    total_feedbacks = ((total_iterations - 1) - 510) // 15 + 1
+                                else:
+                                    total_feedbacks = 1
+                                feedback_index = ((absolute_iteration - 510) // 15) + 1
+                                effective_max_skew = target_max_skew * float(feedback_index) / float(max(1, total_feedbacks))
+                                logging.info(
+                                    "timing feedback iter=%d: growing skew schedule feedback=%d/%d target_max_skew=%g effective_max_skew=%g",
+                                    absolute_iteration,
+                                    feedback_index,
+                                    total_feedbacks,
+                                    target_max_skew,
+                                    effective_max_skew,
+                                )
+                            timing_op.useful_skew_max_skew = effective_max_skew
 
                         # Report timing step.
                         # Temporary solution: modify net weights
                         beg = time.time()
 
+                        logging.info("timing feedback iter=%d: before update_net_weights npaths=%d", absolute_iteration, npaths)
                         timing_op.update_net_weights(
                             max_net_weight=placedb.max_net_weight,
                             n=npaths)
+                        logging.info("timing feedback iter=%d: after update_net_weights", absolute_iteration)
                         
                         # For HeteroSTA, net_weights are modified in-place on GPU - no copy needed
                         # For OpenTimer, we still need to copy from placedb to device
@@ -504,7 +549,9 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                             cur_metric.wns = timing_op.timer.report_wns(split=1) / (time_unit * 1e15)
                             logging.info("tns : %f, wns: %f",cur_metric.tns, cur_metric.wns)
                         else: # heterosta
+                            logging.info("timing feedback iter=%d: before report_tns", absolute_iteration)
                             cur_metric.tns = timing_op.report_tns() / (time_unit * 1e17)
+                            logging.info("timing feedback iter=%d: before report_wns", absolute_iteration)
                             cur_metric.wns = timing_op.report_wns() / (time_unit * 1e15)
                             logging.info("tns : %f, wns: %f",cur_metric.tns, cur_metric.wns)
 
@@ -520,7 +567,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                             int(item) for item in checkpoint_steps.split(",") if item.strip()
                         ]
                     checkpoint_steps = set(int(item) for item in checkpoint_steps)
-                    if iteration in checkpoint_steps:
+                    if absolute_iteration in checkpoint_steps:
                         checkpoint_dir = os.path.join(
                             params.result_dir,
                             params.design_name(),
@@ -529,7 +576,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                         os.makedirs(checkpoint_dir, exist_ok=True)
                         checkpoint_file = os.path.join(
                             checkpoint_dir,
-                            "%s.iter%d.gp.pklz" % (params.design_name(), iteration),
+                            "%s.iter%d.gp.pklz" % (params.design_name(), absolute_iteration),
                         )
                         self.dump(params, placedb, self.pos[0].cpu(), checkpoint_file)
                         logging.info("dumped global placement checkpoint to %s", checkpoint_file)
@@ -908,7 +955,8 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                 timing_op = self.op_collections.timing_op
      
                 if params.timer_engine == "heterosta":
-                    timing_op(self.pos[0].data.clone())
+                    timing_pos = self.pos[0].data.clone() if getattr(timing_op, "use_cuda", False) else self.pos[0].data.clone().cpu()
+                    timing_op(timing_pos)
                     cur_metric.tns = timing_op.report_tns() / (time_unit * 1e17)
                     cur_metric.wns = timing_op.report_wns() / (time_unit * 1e15)
                     logging.info("tns : %f, wns: %f",cur_metric.tns, cur_metric.wns)

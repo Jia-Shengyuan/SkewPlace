@@ -89,6 +89,12 @@ public:
     ///
     static size_t getPinCount();
 
+    ///
+    /// @brief Get number of HeteroSTA cells in the NetlistDB view
+    /// @return number of cells including the synthetic top module cell 0
+    ///
+    static size_t getCellCount();
+
 private:
     ///
     /// @brief Parse all timing-related command line arguments

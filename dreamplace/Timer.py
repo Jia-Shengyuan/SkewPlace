@@ -20,6 +20,7 @@ class Timer(object):
         """
         self.raw_timer = None
         self.timer_engine = timer_engine.lower()
+        self.use_cuda = False
 
         # Validate engine selection
         if self.timer_engine not in ["opentimer","heterosta"]:
@@ -65,6 +66,7 @@ class Timer(object):
         @param placedb the placement database.
         """
         tt = time.time()
+        self.use_cuda = bool(getattr(params, "heterosta_use_cuda", 0)) if self.timer_engine == "heterosta" else False
         self.read(params,placedb)
         self.placedb = placedb
         logging.info("reading timer constraints takes %g seconds" % \
@@ -112,14 +114,32 @@ class Timer(object):
 
     def report_timing_paths_by_split(self, split, n=1):
         """@brief report detailed timing path information for a single split."""
-        if self.timer_engine != "opentimer":
-            raise NotImplementedError("report_timing_paths_by_split is only implemented for OpenTimer")
-        return self.timing_cpp_module.report_timing_paths_by_split(self.raw_timer, n, split)
+        if self.timer_engine == "opentimer":
+            return self.timing_cpp_module.report_timing_paths_by_split(self.raw_timer, n, split)
+        return self.raw_timer.report_timing_paths_by_split(split, n, self.use_cuda)
+
+    def report_all_timing_paths_by_split(self, split):
+        """@brief report all available timing path information for a single split."""
+        if self.timer_engine == "opentimer":
+            return self.report_test_paths_by_split(split, n=None)
+        request = 100000
+        max_request = 1000000
+        previous_count = -1
+        previous_paths = None
+
+        while True:
+            paths = self.report_timing_paths_by_split(split, n=request)
+            count = len(paths)
+            if count < request or count == previous_count or request >= max_request:
+                return paths if count >= previous_count else previous_paths
+            previous_count = count
+            previous_paths = paths
+            request = min(max_request, request * 2)
 
     def report_test_paths_by_split(self, split, n=None):
         """@brief report detailed sequential test paths for a single split."""
         if self.timer_engine != "opentimer":
-            raise NotImplementedError("report_test_paths_by_split is only implemented for OpenTimer")
+            return self.report_timing_paths_by_split(split, n=n or 1)
         # [Jsy] Exporting every sequential test path is too expensive on large
         # benchmarks. Allow callers to cap the OpenTimer report count and then
         # filter the returned paths to sequential endpoints in Python.
@@ -144,18 +164,25 @@ class Timer(object):
         """@brief export a register-to-register timing graph from OpenTimer paths."""
         # [Jsy] Keep the graph export on Timer instead of a separate entry
         # point so downstream prototypes can work from the same STA state.
-        if self.timer_engine != "opentimer":
-            raise NotImplementedError("reg-to-reg timing graph export is only implemented for OpenTimer")
         return self.timing_module.export_reg2reg_timing_graph(
             self, n=n, include_paths=include_paths)
+
+    def export_full_reg2reg_timing_graph(self, include_paths=False):
+        """@brief export a full register-to-register timing graph from all available paths."""
+        if not hasattr(self.timing_module, "build_reg2reg_timing_graph_from_split_paths"):
+            raise NotImplementedError("full reg2reg graph export is not implemented for this timer backend")
+        path_sets = {
+            "max": self.report_all_timing_paths_by_split("max"),
+            "min": self.report_all_timing_paths_by_split("min"),
+        }
+        return self.timing_module.build_reg2reg_timing_graph_from_split_paths(
+            path_sets, include_paths=include_paths)
 
     def solve_useful_skew(self, n=None, max_skew=None):
         """@brief solve the minimal useful-skew LP on exported timing paths."""
         # [Jsy] The original Timer stopped at reporting timing. Expose the
         # minimal LP prototype here to validate useful-skew after placement
         # before touching the main placement objective.
-        if self.timer_engine != "opentimer":
-            raise NotImplementedError("useful skew prototype is only implemented for OpenTimer")
         return self.timing_module.solve_useful_skew_from_timer(
             self, n=n, max_skew=max_skew)
 

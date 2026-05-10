@@ -84,6 +84,40 @@ public:
     torch::Tensor slack);
 
   ///
+  /// \brief Compute net slack at once using native lilith semantics.
+  /// \param timer the timer object.
+  /// \param net_name2id_map the net name to id map.
+  /// \param slack the result array.
+  ///
+  static void evaluate_net_slack(
+    ot::Timer& timer,
+    const _timing_impl::string2index_map_type& net_name2id_map,
+    torch::Tensor slack);
+
+  ///
+  /// \brief Apply lilith net-weighting using caller-provided net slacks.
+  /// \param timer the timer object.
+  /// \param net_name2id_map the net name to id map.
+  /// \param net_criticality the criticality values of nets.
+  /// \param net_weights the weights of nets.
+  /// \param degree_map the degree map of nets.
+  /// \param net_slack the per-net slack array to use.
+  /// \param momentum_decay_factor the decay factor in momentum iteration.
+  /// \param max_net_weight maximum net weight in timing opt.
+  /// \param ignore_net_degree the degree threshold.
+  ///
+  static void update_net_weights_lilith_with_net_slack(
+    ot::Timer& timer,
+    const _timing_impl::string2index_map_type& net_name2id_map,
+    torch::Tensor net_criticality,
+    torch::Tensor net_weights,
+    torch::Tensor degree_map,
+    torch::Tensor net_slack,
+    double momentum_decay_factor,
+    double max_net_weight,
+    int ignore_net_degree);
+
+  ///
   /// \brief read constraint files to timer.
   /// \param timer the OpenTimer timer object.
   /// \param pydb the python placement database.

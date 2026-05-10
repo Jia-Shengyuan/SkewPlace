@@ -160,7 +160,12 @@ struct NetWeighting<T, NetWeightingScheme::LILITH> {
     
     // Calculate run-time of net-weighting update.
     auto beg = std::chrono::steady_clock::now();
-    float wns = timer.report_wns().value();
+    auto wns_opt = timer.report_wns();
+    if (!wns_opt) {
+      dreamplacePrint(kWARN, "report_wns returned no value; skip lilith net-weighting update\n");
+      return;
+    }
+    float wns = *wns_opt;
     double max_nw = 0;
     for (const auto& [name, net] : timer.nets()) {
       // The net id in the dreamplace database.

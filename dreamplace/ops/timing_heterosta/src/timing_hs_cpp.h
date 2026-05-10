@@ -77,6 +77,27 @@ public:
         double max_net_weight, double momentum_decay_factor,
         int ignore_net_degree, bool use_cuda);
 
+    static void evaluate_net_slack(
+        STAHoldings& sta,
+        int num_nets,
+        int num_pins,
+        torch::Tensor flat_netpin,
+        torch::Tensor netpin_start,
+        torch::Tensor slack,
+        bool use_cuda);
+
+    static void update_net_weights_lilith_with_net_slack(
+        STAHoldings& sta,
+        int num_nets,
+        torch::Tensor net_criticality,
+        torch::Tensor net_weights,
+        torch::Tensor degree_map,
+        torch::Tensor net_slack,
+        double momentum_decay_factor,
+        double max_net_weight,
+        int ignore_net_degree,
+        bool use_cuda);
+
     private:
     // Helper functions for internal use - no longer need pin mapping helpers
 };
